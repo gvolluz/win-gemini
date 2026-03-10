@@ -1,6 +1,8 @@
 # Build outputs
 bin/
 obj/
+artifacts/
+tools/
 
 # IDE files
 .idea/

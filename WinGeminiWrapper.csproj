@@ -5,9 +5,23 @@
     <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationIcon>Assets\Icons\gemini.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2210.55" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\Icons\gemini_sparkle_4g_512_lt_f94943af3be039176192d.png" />
+    <None Include="Assets\Icons\gemini_sparkle_aurora_33f86dc0c0257da337c63.svg" />
+    <None Include="Assets\Icons\gemini.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="tools\**\*.cs" />
+    <EmbeddedResource Remove="tools\**\*" />
+    <None Remove="tools\**\*" />
+    <Content Remove="tools\**\*" />
   </ItemGroup>
 </Project>

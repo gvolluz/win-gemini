@@ -28,6 +28,20 @@ dotnet restore
 dotnet run
 ```
 
+## Build release EXE and installer
+
+```powershell
+.\build-installer.ps1
+```
+
+Outputs:
+
+- App EXE (single-file): `artifacts\publish\win-x64\WinGeminiWrapper.exe`
+- Installer EXE: `artifacts\installer\WinGeminiSetup-win-x64.exe`
+- Bundled prerequisite payload: `artifacts\prereqs\MicrosoftEdgeWebView2RuntimeInstallerX64.exe`
+
+The setup EXE includes the app and the offline WebView2 Runtime installer, and installs WebView2 silently if it is missing.
+
 ## Project files
 
 - `Program.cs` - startup flow (login gate then main window)
@@ -35,3 +49,8 @@ dotnet run
 - `MainForm.cs` - Gemini wrapper window + tray integration
 - `NavigationClassifier.cs` - URL-based sign-in/session detection
 - `AppConfig.cs` - shared URLs and persistent profile path
+
+## TODO
+
+- Add logout to wrapper.
+- Add settings to wrapper (first setting: main window close button behavior, `Close app` or `Minimize to tray`).

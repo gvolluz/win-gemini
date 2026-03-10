@@ -17,7 +17,7 @@ internal sealed class MainForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(980, 680);
         Size = new Size(1320, 880);
-        Icon = SystemIcons.Application;
+        Icon = AppIconProvider.GetIcon();
 
         _webView = new WebView2
         {
@@ -28,7 +28,7 @@ internal sealed class MainForm : Form
         _trayMenu = BuildTrayMenu();
         _trayIcon = new NotifyIcon
         {
-            Icon = SystemIcons.Application,
+            Icon = AppIconProvider.GetIcon(),
             Text = "Gemini",
             ContextMenuStrip = _trayMenu,
             Visible = true

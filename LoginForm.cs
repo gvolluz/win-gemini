@@ -17,7 +17,7 @@ internal sealed class LoginForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(900, 620);
         Size = new Size(1100, 760);
-        Icon = SystemIcons.Application;
+        Icon = AppIconProvider.GetIcon();
         ShowInTaskbar = false;
         Opacity = 0;
 
