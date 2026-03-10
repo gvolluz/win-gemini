@@ -9,7 +9,7 @@ internal static class NavigationClassifier
         "ogs.google.com"
     };
 
-    internal static bool IsGeminiChat(Uri? uri)
+    internal static bool IsGeminiApp(Uri? uri)
     {
         if (uri is null)
         {
@@ -24,6 +24,25 @@ internal static class NavigationClassifier
         return uri.AbsolutePath.Equals("/app", StringComparison.OrdinalIgnoreCase) ||
                uri.AbsolutePath.StartsWith("/app/", StringComparison.OrdinalIgnoreCase);
     }
+
+    internal static bool IsNotebookLmApp(Uri? uri)
+    {
+        if (uri is null)
+        {
+            return false;
+        }
+
+        return uri.Host.Equals("notebooklm.google.com", StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static bool IsSupportedApp(Uri? uri) => IsGeminiApp(uri) || IsNotebookLmApp(uri);
+
+    internal static bool IsUriForApp(Uri? uri, WrappedApp app) =>
+        app switch
+        {
+            WrappedApp.NotebookLm => IsNotebookLmApp(uri),
+            _ => IsGeminiApp(uri)
+        };
 
     internal static bool RequiresSignIn(Uri? uri)
     {

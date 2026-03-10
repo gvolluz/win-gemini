@@ -13,7 +13,7 @@ internal sealed class LoginForm : Form
 
     internal LoginForm()
     {
-        Text = "Gemini Sign In";
+        Text = "Google Sign In";
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(900, 620);
         Size = new Size(1100, 760);
@@ -27,7 +27,7 @@ internal sealed class LoginForm : Form
             Height = 36,
             TextAlign = ContentAlignment.MiddleLeft,
             Padding = new Padding(12, 0, 0, 0),
-            Text = "Checking Gemini session..."
+            Text = "Checking Google session..."
         };
 
         _webView = new WebView2
@@ -59,11 +59,11 @@ internal sealed class LoginForm : Form
             await _webView.EnsureCoreWebView2Async(environment);
             ConfigureWebView(_webView.CoreWebView2);
             _fallbackRevealTimer.Start();
-            _webView.CoreWebView2.Navigate(AppConfig.GeminiAppUrl);
+            _webView.CoreWebView2.Navigate(AppConfig.GetAppUrl(AppConfig.DefaultApp));
         }
         catch (Exception exception)
         {
-            ShowLoginWindow($"Unable to initialize Gemini login: {exception.Message}");
+            ShowLoginWindow($"Unable to initialize sign-in flow: {exception.Message}");
         }
     }
 
@@ -93,7 +93,7 @@ internal sealed class LoginForm : Form
 
         var currentUri = _webView.Source;
 
-        if (NavigationClassifier.IsGeminiChat(currentUri))
+        if (NavigationClassifier.IsSupportedApp(currentUri))
         {
             _completed = true;
             _fallbackRevealTimer.Stop();
@@ -115,7 +115,7 @@ internal sealed class LoginForm : Form
             return;
         }
 
-        ShowLoginWindow("Unable to reach Gemini. Check your network and try again.");
+        ShowLoginWindow("Unable to reach Google apps. Check your network and try again.");
     }
 
     private void ShowLoginWindow(string message)
