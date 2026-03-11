@@ -31,7 +31,7 @@ if (-not $Version) {
     if ($versionNode) {
         $Version = $versionNode.InnerText
     } else {
-        $Version = "1.1.0"
+        $Version = "0.0.0"
     }
 }
 
