@@ -3,6 +3,7 @@ bin/
 obj/
 artifacts/
 tools/
+WinGeminiSetup-*.exe
 
 # IDE files
 .idea/

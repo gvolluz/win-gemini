@@ -44,10 +44,12 @@ dotnet run
 Outputs:
 
 - App EXE (single-file): `artifacts\publish\win-x64\WinGeminiWrapper.exe`
-- Installer EXE: `artifacts\installer\WinGeminiSetup-win-x64.exe`
-- Bundled prerequisite payload: `artifacts\prereqs\MicrosoftEdgeWebView2RuntimeInstallerX64.exe`
+- Installer EXE: `WinGeminiSetup-<version>-win-x64.exe` (in repo root)
 
-The setup EXE includes the app and the offline WebView2 Runtime installer, and installs WebView2 silently if it is missing.
+The setup EXE is kept small by not bundling prerequisite runtimes.
+If missing, the installer asks for confirmation and then downloads and installs:
+- .NET Windows Desktop Runtime 8.x
+- Microsoft Edge WebView2 Runtime
 
 ## Project files
 

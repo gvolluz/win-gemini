@@ -3,7 +3,9 @@ param(
     [string]$Runtime = "win-x64",
     [string]$Version = "",
     [string]$IsccPath = "",
-    [string]$WebView2InstallerUrl = "https://go.microsoft.com/fwlink/p/?LinkId=2124701",
+    [string]$WebView2InstallerUrl = "https://go.microsoft.com/fwlink/p/?LinkId=2124703",
+    [string]$DotNetRuntimeUrl = "https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe",
+    [string]$RequiredDotNetRuntimePrefix = "8.0",
     [switch]$SkipWebView2Download,
     [switch]$SkipInstaller
 )
@@ -18,9 +20,6 @@ $fallbackInstallPs1 = Join-Path $projectRoot "installer\Install-WinGemini.ps1"
 $fallbackInstallCmd = Join-Path $projectRoot "installer\install.cmd"
 $publishDir = Join-Path $projectRoot "artifacts\publish\$Runtime"
 $installerDir = Join-Path $projectRoot "artifacts\installer"
-$prereqDir = Join-Path $projectRoot "artifacts\prereqs"
-$webView2Installer = Join-Path $prereqDir "MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
-$minimumOfflineRuntimeBytes = 50MB
 
 if (-not (Test-Path $projectFile)) {
     throw "Project file not found: $projectFile"
@@ -36,11 +35,21 @@ if (-not $Version) {
     }
 }
 
+$safeVersion = $Version -replace '[^0-9A-Za-z\.\-_]', '_'
+$installerFileName = "WinGeminiSetup-$safeVersion-$Runtime.exe"
+$installerOutputDir = $projectRoot
+$installerOutputPath = Join-Path $installerOutputDir $installerFileName
+$installerOutputBaseName = [System.IO.Path]::GetFileNameWithoutExtension($installerFileName)
+
+if ($SkipWebView2Download) {
+    Write-Warning "-SkipWebView2Download is no longer used because prerequisites are downloaded during installation."
+}
+
 Write-Host "Publishing single-file app executable..." -ForegroundColor Cyan
 dotnet publish $projectFile `
     -c $Configuration `
     -r $Runtime `
-    --self-contained true `
+    --self-contained false `
     /p:PublishSingleFile=true `
     /p:IncludeNativeLibrariesForSelfExtract=true `
     /p:PublishTrimmed=false `
@@ -98,7 +107,7 @@ if (-not $IsccPath -or -not (Test-Path $IsccPath)) {
     Copy-Item -Path $fallbackInstallPs1 -Destination (Join-Path $payloadDir "Install-WinGemini.ps1") -Force
     Copy-Item -Path $fallbackInstallCmd -Destination (Join-Path $payloadDir "install.cmd") -Force
 
-    $setupExe = Join-Path $installerDir "WinGeminiSetup-$Runtime.exe"
+    $setupExe = $installerOutputPath
     $sedFile = Join-Path $installerDir "WinGeminiWrapper-iexpress.sed"
     $iExpressPath = Join-Path $env:WINDIR "System32\iexpress.exe"
 
@@ -159,35 +168,6 @@ FILE2="install.cmd"
     exit 0
 }
 
-New-Item -ItemType Directory -Force -Path $prereqDir | Out-Null
-$needsDownload = $true
-if (Test-Path $webView2Installer) {
-    $currentSize = (Get-Item $webView2Installer).Length
-    if ($currentSize -ge $minimumOfflineRuntimeBytes) {
-        $needsDownload = $false
-    } else {
-        Write-Warning "Existing WebView2 installer is too small ($currentSize bytes). Re-downloading offline runtime package."
-    }
-}
-
-if ($needsDownload) {
-    if ($SkipWebView2Download) {
-        throw "Valid offline WebView2 installer not available at $webView2Installer and -SkipWebView2Download was set."
-    }
-
-    Write-Host "Downloading WebView2 Runtime installer..." -ForegroundColor Cyan
-    Invoke-WebRequest -Uri $WebView2InstallerUrl -OutFile $webView2Installer
-}
-
-if (-not (Test-Path $webView2Installer)) {
-    throw "WebView2 installer was not found after download attempt: $webView2Installer"
-}
-
-$downloadedSize = (Get-Item $webView2Installer).Length
-if ($downloadedSize -lt $minimumOfflineRuntimeBytes) {
-    throw "Downloaded WebView2 installer appears to be a bootstrapper ($downloadedSize bytes), not the offline runtime package."
-}
-
 New-Item -ItemType Directory -Force -Path $installerDir | Out-Null
 
 Write-Host "Building installer executable..." -ForegroundColor Cyan
@@ -195,8 +175,11 @@ Write-Host "Building installer executable..." -ForegroundColor Cyan
     "/DAppVersion=$Version" `
     "/DRuntime=$Runtime" `
     "/DSourceDir=$publishDir" `
-    "/DOutputDir=$installerDir" `
-    "/DWebView2InstallerPath=$webView2Installer" `
+    "/DOutputDir=$installerOutputDir" `
+    "/DOutputBaseFilename=$installerOutputBaseName" `
+    "/DDotNetRuntimeUrl=$DotNetRuntimeUrl" `
+    "/DRequiredDotNetRuntimePrefix=$RequiredDotNetRuntimePrefix" `
+    "/DWebView2BootstrapperUrl=$WebView2InstallerUrl" `
     "/DProjectDir=$projectRoot" `
     $issFile
 
@@ -204,7 +187,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "ISCC failed with exit code $LASTEXITCODE."
 }
 
-$setupExe = Join-Path $installerDir "WinGeminiSetup-$Runtime.exe"
+$setupExe = $installerOutputPath
 if (Test-Path $setupExe) {
     Write-Host "Installer EXE ready:" -ForegroundColor Green
     Write-Host "  $setupExe"
