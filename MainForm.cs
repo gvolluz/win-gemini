@@ -305,7 +305,7 @@ internal sealed class MainForm : Form
     private void UpdateAppChrome()
     {
         var appName = AppConfig.GetAppDisplayName(_currentApp);
-        Text = appName;
+        Text = AppVersionProvider.FormatWindowTitle(appName);
         _trayIcon.Text = appName;
         _openMenuItem.Text = $"Open {appName}";
     }

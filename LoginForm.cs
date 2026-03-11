@@ -13,7 +13,7 @@ internal sealed class LoginForm : Form
 
     internal LoginForm()
     {
-        Text = "Google Sign In";
+        Text = AppVersionProvider.FormatWindowTitle("Google Sign In");
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(900, 620);
         Size = new Size(1100, 760);

@@ -11,7 +11,7 @@ internal sealed class SettingsForm : Form
 
     internal SettingsForm(CloseButtonBehavior currentCloseBehavior)
     {
-        Text = "Settings";
+        Text = AppVersionProvider.FormatWindowTitle("Settings");
         StartPosition = FormStartPosition.CenterParent;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MinimizeBox = false;
