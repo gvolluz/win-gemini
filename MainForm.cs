@@ -19,9 +19,10 @@ internal sealed class MainForm : Form
     private readonly System.Windows.Forms.Timer _topBarVisibilityTimer;
     private CoreWebView2Environment? _webViewEnvironment;
     private AppState _appState;
-    private ToolStripMenuItem _openMenuItem = null!;
+    private ToolStripMenuItem _switchAppMenuItem = null!;
     private bool _exitRequested;
     private bool _balloonShown;
+    private bool _logoutInProgress;
     private WrappedApp _currentApp;
 
     internal MainForm()
@@ -57,7 +58,7 @@ internal sealed class MainForm : Form
             ContextMenuStrip = _trayMenu,
             Visible = true
         };
-        _trayIcon.DoubleClick += (_, _) => RestoreFromTray();
+        _trayIcon.MouseClick += TrayIcon_MouseClick;
 
         _windowStateSaveTimer = new System.Windows.Forms.Timer
         {
@@ -214,12 +215,17 @@ internal sealed class MainForm : Form
             GripStyle = ToolStripGripStyle.Hidden,
             RenderMode = ToolStripRenderMode.System
         };
+        var logoutButton = new ToolStripButton("Log out", null, async (_, _) => await LogoutAsync())
+        {
+            Alignment = ToolStripItemAlignment.Right
+        };
 
         topBar.Items.Add(new ToolStripLabel("App:"));
         topBar.Items.Add(_appSwitcher);
         topBar.Items.Add(new ToolStripSeparator());
         topBar.Items.Add(new ToolStripButton("Refresh", null, (_, _) => GetCurrentWebView()?.CoreWebView2?.Reload()));
         topBar.Items.Add(new ToolStripButton("Settings", null, (_, _) => OpenSettings()));
+        topBar.Items.Add(logoutButton);
 
         return topBar;
     }
@@ -227,17 +233,51 @@ internal sealed class MainForm : Form
     private ContextMenuStrip BuildTrayMenu()
     {
         var menu = new ContextMenuStrip();
+        _switchAppMenuItem = new ToolStripMenuItem(string.Empty, null, (_, _) => SwitchApp(GetInactiveApp(), true));
+        menu.Opening += (_, _) => UpdateTrayMenuItems();
 
-        _openMenuItem = new ToolStripMenuItem("Open", null, (_, _) => RestoreFromTray());
-        menu.Items.Add(_openMenuItem);
-        menu.Items.Add("Go to Gemini", null, (_, _) => SwitchApp(WrappedApp.Gemini, true));
-        menu.Items.Add("Go to NotebookLM", null, (_, _) => SwitchApp(WrappedApp.NotebookLm, true));
+        menu.Items.Add(_switchAppMenuItem);
         menu.Items.Add("Refresh", null, (_, _) => GetCurrentWebView()?.CoreWebView2?.Reload());
         menu.Items.Add("Settings", null, (_, _) => OpenSettings());
-        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("Log out", null, async (_, _) => await LogoutAsync());
         menu.Items.Add("Exit", null, (_, _) => ExitApplication());
+        UpdateTrayMenuItems();
 
         return menu;
+    }
+
+    private void TrayIcon_MouseClick(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left)
+        {
+            return;
+        }
+
+        ToggleWindowVisibilityFromTray();
+    }
+
+    private void ToggleWindowVisibilityFromTray()
+    {
+        if (Visible && WindowState != FormWindowState.Minimized)
+        {
+            HideToTray();
+            return;
+        }
+
+        RestoreFromTray();
+    }
+
+    private WrappedApp GetInactiveApp()
+    {
+        return _currentApp == WrappedApp.Gemini
+            ? WrappedApp.NotebookLm
+            : WrappedApp.Gemini;
+    }
+
+    private void UpdateTrayMenuItems()
+    {
+        var inactiveAppName = AppConfig.GetAppDisplayName(GetInactiveApp());
+        _switchAppMenuItem.Text = $"Go to {inactiveAppName}";
     }
 
     private void AppSwitcher_SelectedIndexChanged(object? sender, EventArgs e)
@@ -305,9 +345,9 @@ internal sealed class MainForm : Form
     private void UpdateAppChrome()
     {
         var appName = AppConfig.GetAppDisplayName(_currentApp);
-        Text = appName;
+        Text = AppVersionProvider.FormatWindowTitle(appName);
         _trayIcon.Text = appName;
-        _openMenuItem.Text = $"Open {appName}";
+        UpdateTrayMenuItems();
     }
 
     private void MainForm_WindowPlacementChanged(object? sender, EventArgs e)
@@ -448,6 +488,72 @@ internal sealed class MainForm : Form
 
         _appState.CloseButtonBehavior = settingsForm.SelectedCloseButtonBehavior;
         SaveAppStateNow();
+    }
+
+    private async Task LogoutAsync()
+    {
+        if (_logoutInProgress)
+        {
+            return;
+        }
+
+        if (MessageBox.Show(
+                this,
+                "This will sign you out of Google in this wrapper and clear saved session data. Continue?",
+                "Log out",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question) != DialogResult.Yes)
+        {
+            return;
+        }
+
+        _logoutInProgress = true;
+        UseWaitCursor = true;
+
+        try
+        {
+            await EnsureWebViewInitializedAsync(WrappedApp.Gemini);
+            await EnsureWebViewInitializedAsync(WrappedApp.NotebookLm);
+
+            var webViews = _webViews.Values.ToArray();
+            foreach (var webView in webViews)
+            {
+                var core = webView.CoreWebView2;
+                if (core is null)
+                {
+                    continue;
+                }
+
+                core.CookieManager.DeleteAllCookies();
+                await core.Profile.ClearBrowsingDataAsync();
+            }
+
+            _appState.SetLastUrl(WrappedApp.Gemini, null);
+            _appState.SetLastUrl(WrappedApp.NotebookLm, null);
+            SaveAppStateNow();
+
+            foreach (var app in _webViews.Keys.ToArray())
+            {
+                var webView = _webViews[app];
+                webView.CoreWebView2?.Navigate(AppConfig.GetAppUrl(app));
+            }
+
+            SwitchApp(AppConfig.DefaultApp, restoreFromTray: false);
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show(
+                this,
+                $"Could not complete logout.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
+                "Log out failed",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
+        finally
+        {
+            UseWaitCursor = false;
+            _logoutInProgress = false;
+        }
     }
 
     private void MainForm_FormClosing(object? sender, FormClosingEventArgs e)

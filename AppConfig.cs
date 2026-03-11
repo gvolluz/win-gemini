@@ -2,6 +2,8 @@ namespace WinGeminiWrapper;
 
 internal static class AppConfig
 {
+    internal const string ProductName = "Win Gemini";
+
     internal static readonly string AppDataRootFolder = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "WinGeminiWrapper");

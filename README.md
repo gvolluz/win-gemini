@@ -11,6 +11,7 @@ A native Windows desktop wrapper for Gemini and NotebookLM using `WinForms + Web
 - Saves last visited URL for each app and restores it on next launch.
 - Saves window size, position, and state (normal/maximized/minimized) as they change, and restores them on startup.
 - Includes a settings page with close-button behavior: `Minimize to tray` or `Close app`.
+- Logout action (top bar + tray menu) clears wrapper WebView session data and returns apps to sign-in.
 - Startup sign-in gate:
   - If an existing Google session is present, the login window stays hidden and the app opens directly.
   - If not signed in, a login window appears and uses the normal Google sign-in flow.
@@ -61,6 +62,3 @@ If missing, the installer asks for confirmation and then downloads and installs:
 - `NavigationClassifier.cs` - URL-based sign-in/session detection for Gemini + NotebookLM
 - `AppConfig.cs` - shared URLs and persistent profile path
 
-## TODO
-
-- Add logout to wrapper.
