@@ -3,7 +3,8 @@ bin/
 obj/
 artifacts/
 tools/
-tmp-build/*
+tmp-build/
+tmp/
 ExportEvernote/
 # IDE files
 .idea/
