@@ -35,12 +35,24 @@ internal static class NavigationClassifier
         return uri.Host.Equals("notebooklm.google.com", StringComparison.OrdinalIgnoreCase);
     }
 
-    internal static bool IsSupportedApp(Uri? uri) => IsGeminiApp(uri) || IsNotebookLmApp(uri);
+    internal static bool IsGoogleDriveApp(Uri? uri)
+    {
+        if (uri is null)
+        {
+            return false;
+        }
+
+        return uri.Host.Equals("drive.google.com", StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static bool IsSupportedApp(Uri? uri) => IsGeminiApp(uri) || IsNotebookLmApp(uri) || IsGoogleDriveApp(uri);
 
     internal static bool IsUriForApp(Uri? uri, WrappedApp app) =>
         app switch
         {
             WrappedApp.NotebookLm => IsNotebookLmApp(uri),
+            WrappedApp.GoogleDrive => IsGoogleDriveApp(uri),
+            WrappedApp.EvernoteExport => false,
             _ => IsGeminiApp(uri)
         };
 
