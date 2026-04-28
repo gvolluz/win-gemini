@@ -1,12 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <Version>2.0.0</Version>
+    <Version>2.1.0</Version>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <ApplicationIcon>Assets\Icons\gemini.ico</ApplicationIcon>
+    <ApplicationIcon>Assets\Icons\WinGeminiIcon.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
@@ -17,9 +17,10 @@
   </ItemGroup>
 
   <ItemGroup>
-    <EmbeddedResource Include="Assets\Icons\gemini_sparkle_4g_512_lt_f94943af3be039176192d.png" />
-    <None Include="Assets\Icons\gemini_sparkle_aurora_33f86dc0c0257da337c63.svg" />
-    <None Include="Assets\Icons\gemini.ico" />
+    <EmbeddedResource Include="Assets\Icons\WinGeminiIcon_color.png" />
+    <EmbeddedResource Include="Assets\Icons\WinGeminiIcon_gray.png" />
+    <None Include="Assets\Icons\WinGeminiIcon.svg" />
+    <None Include="Assets\Icons\WinGeminiIcon.ico" />
   </ItemGroup>
 
   <ItemGroup>

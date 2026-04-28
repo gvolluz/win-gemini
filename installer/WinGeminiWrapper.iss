@@ -50,7 +50,7 @@ WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=lowest
-SetupIconFile={#ProjectDir}\Assets\Icons\gemini.ico
+SetupIconFile={#ProjectDir}\Assets\Icons\WinGeminiIcon.ico
 UninstallDisplayIcon={app}\WinGeminiWrapper.exe
 
 [Languages]

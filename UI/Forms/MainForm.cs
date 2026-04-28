@@ -10,6 +10,7 @@ internal sealed class MainForm : Form
     private const int TopBarPollMs = 120;
     private const int GoogleDriveSyncDebounceMs = 1200;
     private const int EvernoteAutoExportCooldownSeconds = 30;
+    private const int TraySyncAnimationIntervalMs = 90;
 
     private readonly Panel _webViewHost;
     private readonly Panel _evernoteExportPanel;
@@ -29,6 +30,7 @@ internal sealed class MainForm : Form
     private readonly System.Windows.Forms.Timer _topBarVisibilityTimer;
     private readonly System.Windows.Forms.Timer _evernotePollingTimer;
     private readonly System.Windows.Forms.Timer _googleDriveSyncTimer;
+    private readonly System.Windows.Forms.Timer _traySyncAnimationTimer;
     private CoreWebView2Environment? _webViewEnvironment;
     private AppState _appState;
     private ToolStripMenuItem _switchAppMenuItem = null!;
@@ -38,6 +40,8 @@ internal sealed class MainForm : Form
     private TreeNode? _evernoteContextNode;
     private bool _syncingEvernoteTreeChecks;
     private bool _evernotePollingInProgress;
+    private bool _evernoteExportInProgress;
+    private int _traySyncAnimationFrameIndex;
     private DateTime _lastEvernoteAutoExportUtc = DateTime.MinValue;
     private bool _googleDriveSyncInProgress;
     private bool _suspendGoogleDriveSyncQueue;
@@ -49,6 +53,7 @@ internal sealed class MainForm : Form
 
     internal MainForm()
     {
+        AppLogger.Info("MainForm constructor started.");
         _appState = AppStateStore.Load();
         _appState.Normalize();
         _currentApp = Enum.IsDefined(typeof(WrappedApp), _appState.LastSelectedApp)
@@ -84,11 +89,12 @@ internal sealed class MainForm : Form
         _trayMenu = BuildTrayMenu();
         _trayIcon = new NotifyIcon
         {
-            Icon = AppIconProvider.GetIcon(),
+            Icon = AppIconProvider.GetTrayIdleIcon(),
             Text = AppConfig.GetAppDisplayName(_currentApp),
             ContextMenuStrip = _trayMenu,
             Visible = true
         };
+        AppLogger.Info("Tray icon initialized.");
         _trayIcon.MouseClick += TrayIcon_MouseClick;
 
         _windowStateSaveTimer = new System.Windows.Forms.Timer
@@ -105,7 +111,6 @@ internal sealed class MainForm : Form
 
         _evernotePollingTimer = new System.Windows.Forms.Timer();
         _evernotePollingTimer.Tick += EvernotePollingTimer_Tick;
-        ApplyEvernotePollingSettings();
 
         _googleDriveSyncTimer = new System.Windows.Forms.Timer
         {
@@ -113,7 +118,19 @@ internal sealed class MainForm : Form
         };
         _googleDriveSyncTimer.Tick += GoogleDriveSyncTimer_Tick;
 
+        _traySyncAnimationTimer = new System.Windows.Forms.Timer
+        {
+            Interval = TraySyncAnimationIntervalMs
+        };
+        _traySyncAnimationTimer.Tick += TraySyncAnimationTimer_Tick;
+        AppLogger.Info("Tray animation timer initialized.");
+
+        AppLogger.Info("Applying Evernote polling settings.");
+        ApplyEvernotePollingSettings();
+
         UpdateAppChrome();
+        RefreshTrayPollingIconState();
+        AppLogger.Info("MainForm constructor completed.");
 
         Load += MainForm_Load;
         Shown += MainForm_Shown;
@@ -154,6 +171,7 @@ internal sealed class MainForm : Form
         }
         catch (Exception exception)
         {
+            AppLogger.Error("MainForm_Load failed.", exception);
             MessageBox.Show(
                 this,
                 $"Unable to start application window.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
@@ -678,7 +696,7 @@ internal sealed class MainForm : Form
                 $"DB detectee: {dbPath} | Stacks: {stacks.Count} | Notebooks: {stacks.Sum(stack => stack.Notebooks.Count)}");
             if (refreshTracking)
             {
-                PollEvernoteTracking(allowAutoExport: false, showErrors: false, ignorePause: true);
+                PollEvernoteTracking(allowAutoExport: false, showErrors: false, ignorePause: false);
             }
         }
         catch (Exception exception)
@@ -1395,6 +1413,9 @@ internal sealed class MainForm : Form
 
     private void BeginEvernoteExportProgress(int totalSteps, string source)
     {
+        _evernoteExportInProgress = true;
+        RefreshTrayPollingIconState();
+
         _evernoteExportProgressBar.Style = ProgressBarStyle.Continuous;
         _evernoteExportProgressBar.MarqueeAnimationSpeed = 0;
         _evernoteExportProgressBar.Minimum = 0;
@@ -1438,6 +1459,9 @@ internal sealed class MainForm : Form
         _evernoteExportProgressBar.MarqueeAnimationSpeed = 0;
         _evernoteExportProgressBar.Value = 0;
         _evernoteExportProgressBar.Visible = false;
+
+        _evernoteExportInProgress = false;
+        RefreshTrayPollingIconState();
     }
 
     private List<SelectedEvernoteNotebookForExport> GetSelectedNotebooksForExport()
@@ -1707,6 +1731,7 @@ internal sealed class MainForm : Form
     {
         var intervalMinutes = Math.Max(1, _appState.EvernotePollingIntervalMinutes);
         _evernotePollingTimer.Interval = checked(intervalMinutes * 60 * 1000);
+        RefreshTrayPollingIconState();
 
         if (_appState.EvernotePollingPaused)
         {
@@ -1747,6 +1772,7 @@ internal sealed class MainForm : Form
         }
 
         _evernotePollingInProgress = true;
+        RefreshTrayPollingIconState();
         try
         {
             var previousNotebookMap = _appState.GetEvernoteNotebookSnapshotMap();
@@ -1832,6 +1858,7 @@ internal sealed class MainForm : Form
         finally
         {
             _evernotePollingInProgress = false;
+            RefreshTrayPollingIconState();
         }
     }
 
@@ -1929,6 +1956,73 @@ internal sealed class MainForm : Form
         Text = AppVersionProvider.FormatWindowTitle(appName);
         _trayIcon.Text = appName;
         UpdateTrayMenuItems();
+    }
+
+    private void RefreshTrayPollingIconState(bool? pausedOverride = null)
+    {
+        if (_trayIcon is null)
+        {
+            return;
+        }
+
+        var isPollingPaused = pausedOverride ?? _appState.EvernotePollingPaused;
+        if (_traySyncAnimationTimer is null)
+        {
+            _trayIcon.Icon = isPollingPaused
+                ? AppIconProvider.GetTrayIdleIcon()
+                : AppIconProvider.GetTrayActiveIcon();
+            return;
+        }
+
+        var isEvernoteWorkInProgress = !isPollingPaused && (_evernotePollingInProgress || _evernoteExportInProgress);
+        if (isEvernoteWorkInProgress)
+        {
+            if (!_traySyncAnimationTimer.Enabled)
+            {
+                _traySyncAnimationFrameIndex = 0;
+                _traySyncAnimationTimer.Start();
+            }
+
+            SetTraySyncAnimationFrame(_traySyncAnimationFrameIndex);
+            return;
+        }
+
+        _traySyncAnimationTimer.Stop();
+        _traySyncAnimationFrameIndex = 0;
+        _trayIcon.Icon = isPollingPaused
+            ? AppIconProvider.GetTrayIdleIcon()
+            : AppIconProvider.GetTrayActiveIcon();
+    }
+
+    private void TraySyncAnimationTimer_Tick(object? sender, EventArgs e)
+    {
+        if (_traySyncAnimationTimer is null)
+        {
+            return;
+        }
+
+        var isEvernoteWorkInProgress = !_appState.EvernotePollingPaused && (_evernotePollingInProgress || _evernoteExportInProgress);
+        if (!isEvernoteWorkInProgress)
+        {
+            RefreshTrayPollingIconState();
+            return;
+        }
+
+        _traySyncAnimationFrameIndex++;
+        SetTraySyncAnimationFrame(_traySyncAnimationFrameIndex);
+    }
+
+    private void SetTraySyncAnimationFrame(int frameIndex)
+    {
+        var frames = AppIconProvider.GetTraySpinIcons();
+        if (frames.Count == 0)
+        {
+            _trayIcon.Icon = AppIconProvider.GetTrayActiveIcon();
+            return;
+        }
+
+        var normalizedIndex = Math.Abs(frameIndex % frames.Count);
+        _trayIcon.Icon = frames[normalizedIndex];
     }
 
     private void MainForm_WindowPlacementChanged(object? sender, EventArgs e)
@@ -2132,6 +2226,7 @@ internal sealed class MainForm : Form
 
     private void OpenSettings()
     {
+        var pausedBeforeDialog = _appState.EvernotePollingPaused;
         using var settingsForm = new SettingsForm(
             _appState.CloseButtonBehavior,
             _appState.EvernotePollingIntervalMinutes,
@@ -2142,8 +2237,10 @@ internal sealed class MainForm : Form
             _appState.GoogleDriveClientId,
             _appState.GoogleDriveClientSecret,
             _appState.GoogleDriveConfigFileId);
+        settingsForm.EvernotePollingPausedChanged += isPaused => RefreshTrayPollingIconState(isPaused);
         if (settingsForm.ShowDialog(this) != DialogResult.OK)
         {
+            RefreshTrayPollingIconState(pausedBeforeDialog);
             return;
         }
 
@@ -2205,6 +2302,7 @@ internal sealed class MainForm : Form
 
         if (!stateChanged)
         {
+            RefreshTrayPollingIconState();
             return;
         }
 
@@ -2382,6 +2480,7 @@ internal sealed class MainForm : Form
     {
         if (disposing)
         {
+            _traySyncAnimationTimer.Dispose();
             _googleDriveSyncTimer.Dispose();
             _evernotePollingTimer.Dispose();
             _topBarVisibilityTimer.Dispose();

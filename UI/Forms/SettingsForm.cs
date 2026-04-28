@@ -15,6 +15,7 @@ internal sealed class SettingsForm : Form
 
     private string? _googleDriveClientIdValue;
     private string? _googleDriveClientSecretValue;
+    internal event Action<bool>? EvernotePollingPausedChanged;
 
     internal CloseButtonBehavior SelectedCloseButtonBehavior =>
         _closeBehaviorComboBox.SelectedIndex == 1
@@ -107,6 +108,7 @@ internal sealed class SettingsForm : Form
             Text = "Pause automatic polling",
             Checked = currentEvernotePollingPaused
         };
+        _pausePollingCheckBox.CheckedChanged += (_, _) => EvernotePollingPausedChanged?.Invoke(_pausePollingCheckBox.Checked);
 
         var maxMarkdownLabel = new Label
         {

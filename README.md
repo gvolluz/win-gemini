@@ -82,17 +82,6 @@ dotnet restore
 dotnet run
 ```
 
-## Evernote single-note diagnostic (headings/lists)
-
-To debug conversion for one specific note (raw ENML + converted Markdown + ENML structure dump):
-
-```powershell
-dotnet run -- --evernote-note-test --note c5592033-94e1-c16c-0416-72c4dc98b61b --root "C:\Path\To\EvernoteRoot" --out ".\tmp\evernote-note-test"
-```
-
-If `--note` is omitted, it defaults to `c5592033-94e1-c16c-0416-72c4dc98b61b`.
-If `--root` is omitted, the app tries to reuse the Evernote root folder saved in app settings.
-
 ## Build release EXE and installer
 
 ```powershell
