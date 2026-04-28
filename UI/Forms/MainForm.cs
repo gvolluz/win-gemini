@@ -2077,25 +2077,38 @@ internal sealed class MainForm : Form
             ApplyEvernotePollingSettings();
             SaveAppStateNow(queueGoogleDriveSync: false);
 
+            var nowUtc = DateTimeOffset.UtcNow;
             updatedRequesterDocument.PauseAutomaticPolling = false;
-            updatedRequesterDocument.UpdatedAtUtc = DateTimeOffset.UtcNow;
+            updatedRequesterDocument.UpdatedAtUtc = nowUtc;
 
-            await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+            var requesterUpsert = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
                 _appState,
                 incomingRequest.Requester.FileName,
                 updatedRequesterDocument,
                 incomingRequest.Requester.FileId,
                 CancellationToken.None);
-            LogPollingLock($"Requester state updated after approval: {incomingRequest.Requester.FileName}.");
+            LogPollingLock(
+                $"Requester state updated after approval: {incomingRequest.Requester.FileName} " +
+                $"(success={requesterUpsert.IsSuccess}, fileId={requesterUpsert.FileId ?? "n/a"}).");
+            if (!requesterUpsert.IsSuccess)
+            {
+                LogPollingLock($"Requester update failed after approval: {requesterUpsert.Error ?? "unknown error"}.");
+                return true;
+            }
 
             var updatedLocalDocument = BuildLocalPollingStateDocument();
-            await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+            updatedLocalDocument.PendingTakeoverRequest = null;
+            updatedLocalDocument.PauseAutomaticPolling = true;
+            updatedLocalDocument.UpdatedAtUtc = nowUtc;
+            var localUpsert = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
                 _appState,
                 _localMachineStateFileName,
                 updatedLocalDocument,
                 _localMachineStateFileId,
                 CancellationToken.None);
-            LogPollingLock($"Owner state updated after approval: {_localMachineStateFileName}.");
+            LogPollingLock(
+                $"Owner state updated after approval: {_localMachineStateFileName} " +
+                $"(success={localUpsert.IsSuccess}, fileId={localUpsert.FileId ?? "n/a"}).");
 
             return true;
         }
@@ -2103,13 +2116,15 @@ internal sealed class MainForm : Form
         updatedRequesterDocument.PauseAutomaticPolling = true;
         updatedRequesterDocument.UpdatedAtUtc = DateTimeOffset.UtcNow;
 
-        await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+        var rejectUpsert = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
             _appState,
             incomingRequest.Requester.FileName,
             updatedRequesterDocument,
             incomingRequest.Requester.FileId,
             CancellationToken.None);
-        LogPollingLock($"Requester state updated after rejection: {incomingRequest.Requester.FileName}.");
+        LogPollingLock(
+            $"Requester state updated after rejection: {incomingRequest.Requester.FileName} " +
+            $"(success={rejectUpsert.IsSuccess}, fileId={rejectUpsert.FileId ?? "n/a"}).");
 
         return true;
     }
