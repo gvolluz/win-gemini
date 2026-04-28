@@ -84,6 +84,8 @@ internal sealed class MainForm : Form
         _localMachineStateFileName = _localMachineDefaultStateFileName;
         _appState = AppStateStore.Load();
         _appState.Normalize();
+        // Do not trust local PauseAutomaticPolling at startup; Drive state is source of truth.
+        _appState.EvernotePollingPaused = true;
         _currentApp = Enum.IsDefined(typeof(WrappedApp), _appState.LastSelectedApp)
             ? _appState.LastSelectedApp
             : AppConfig.DefaultApp;
@@ -2080,19 +2082,14 @@ internal sealed class MainForm : Form
             var nowUtc = DateTimeOffset.UtcNow;
             updatedRequesterDocument.PauseAutomaticPolling = false;
             updatedRequesterDocument.UpdatedAtUtc = nowUtc;
-
-            var requesterUpsert = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
-                _appState,
-                incomingRequest.Requester.FileName,
+            var requesterApproved = await UpsertAndVerifyRequesterStateAsync(
+                incomingRequest.Requester,
                 updatedRequesterDocument,
-                incomingRequest.Requester.FileId,
-                CancellationToken.None);
-            LogPollingLock(
-                $"Requester state updated after approval: {incomingRequest.Requester.FileName} " +
-                $"(success={requesterUpsert.IsSuccess}, fileId={requesterUpsert.FileId ?? "n/a"}).");
-            if (!requesterUpsert.IsSuccess)
+                expectedPauseAutomaticPolling: false,
+                operationLabel: "approval");
+            if (!requesterApproved)
             {
-                LogPollingLock($"Requester update failed after approval: {requesterUpsert.Error ?? "unknown error"}.");
+                LogPollingLock("Requester update after approval could not be verified on Drive.");
                 return true;
             }
 
@@ -2115,18 +2112,76 @@ internal sealed class MainForm : Form
 
         updatedRequesterDocument.PauseAutomaticPolling = true;
         updatedRequesterDocument.UpdatedAtUtc = DateTimeOffset.UtcNow;
-
-        var rejectUpsert = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
-            _appState,
-            incomingRequest.Requester.FileName,
+        await UpsertAndVerifyRequesterStateAsync(
+            incomingRequest.Requester,
             updatedRequesterDocument,
-            incomingRequest.Requester.FileId,
-            CancellationToken.None);
-        LogPollingLock(
-            $"Requester state updated after rejection: {incomingRequest.Requester.FileName} " +
-            $"(success={rejectUpsert.IsSuccess}, fileId={rejectUpsert.FileId ?? "n/a"}).");
+            expectedPauseAutomaticPolling: true,
+            operationLabel: "rejection");
 
         return true;
+    }
+
+    private async Task<bool> UpsertAndVerifyRequesterStateAsync(
+        GoogleDrivePollingStateFile requesterState,
+        GoogleDrivePollingStateDocument updatedRequesterDocument,
+        bool expectedPauseAutomaticPolling,
+        string operationLabel)
+    {
+        var preferredFileId = requesterState.FileId;
+        for (var attempt = 1; attempt <= 3; attempt++)
+        {
+            var upsert = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+                _appState,
+                requesterState.FileName,
+                updatedRequesterDocument,
+                preferredFileId,
+                CancellationToken.None);
+            if (upsert.IsSuccess && !string.IsNullOrWhiteSpace(upsert.FileId))
+            {
+                preferredFileId = upsert.FileId;
+            }
+
+            LogPollingLock(
+                $"Requester upsert ({operationLabel}) attempt {attempt}/3: " +
+                $"success={upsert.IsSuccess}, fileId={upsert.FileId ?? preferredFileId ?? "n/a"}, error={upsert.Error ?? "none"}.");
+            if (!upsert.IsSuccess)
+            {
+                await Task.Delay(250);
+                continue;
+            }
+
+            var verificationList = await GoogleDriveConfigSyncService.ListPollingStatesAsync(_appState, CancellationToken.None);
+            if (!verificationList.IsSuccess)
+            {
+                LogPollingLock($"Requester verify list failed on attempt {attempt}/3: {verificationList.Error ?? "unknown error"}.");
+                await Task.Delay(250);
+                continue;
+            }
+
+            var fileIdForLookup = preferredFileId ?? requesterState.FileId;
+            var reloadedRequester = verificationList.States.FirstOrDefault(state =>
+                string.Equals(state.FileId, fileIdForLookup, StringComparison.OrdinalIgnoreCase));
+            if (reloadedRequester is null)
+            {
+                LogPollingLock($"Requester verify attempt {attempt}/3: file not found by id={fileIdForLookup ?? "n/a"}.");
+                await Task.Delay(250);
+                continue;
+            }
+
+            var pendingIsCleared = reloadedRequester.Document.PendingTakeoverRequest is null;
+            var pauseMatches = reloadedRequester.Document.PauseAutomaticPolling == expectedPauseAutomaticPolling;
+            LogPollingLock(
+                $"Requester verify attempt {attempt}/3: pendingCleared={pendingIsCleared}, " +
+                $"pause={reloadedRequester.Document.PauseAutomaticPolling}, expectedPause={expectedPauseAutomaticPolling}.");
+            if (pendingIsCleared && pauseMatches)
+            {
+                return true;
+            }
+
+            await Task.Delay(250);
+        }
+
+        return false;
     }
 
     private GoogleDrivePollingStateFile? DeterminePollingLockOwner(IEnumerable<GoogleDrivePollingStateFile> states)
