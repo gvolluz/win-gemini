@@ -6,6 +6,7 @@ internal sealed class SettingsForm : Form
     private readonly NumericUpDown _pollIntervalMinutesNumeric;
     private readonly CheckBox _pausePollingCheckBox;
     private readonly Label _pollingLockOwnerLabel;
+    private readonly Button _pollingForceLockButton;
     private readonly Label _pollingPendingRequestLabel;
     private readonly Label _pollingNextStatePollLabel;
     private readonly NumericUpDown _maxMarkdownFilesNumeric;
@@ -19,7 +20,11 @@ internal sealed class SettingsForm : Form
     private string? _googleDriveClientIdValue;
     private string? _googleDriveClientSecretValue;
     private bool _suspendPausePollingChangedEvent;
+    private bool _pausePollingToggleBusy;
+    private bool _pausePollingRequestInProgress;
+    private bool _confirmedPausePollingState;
     internal event Action<bool>? EvernotePollingPausedChanged;
+    internal event Action? ForcePollingLockRequested;
     internal event Action? ExportSettingsRequested;
     internal event Action? ImportSettingsRequested;
 
@@ -50,6 +55,7 @@ internal sealed class SettingsForm : Form
     {
         _googleDriveClientIdValue = NormalizeOptionalText(currentGoogleDriveClientId);
         _googleDriveClientSecretValue = NormalizeOptionalText(currentGoogleDriveClientSecret);
+        _confirmedPausePollingState = currentEvernotePollingPaused;
 
         Text = AppVersionProvider.FormatWindowTitle("Settings");
         StartPosition = FormStartPosition.CenterParent;
@@ -121,7 +127,17 @@ internal sealed class SettingsForm : Form
                 return;
             }
 
-            EvernotePollingPausedChanged?.Invoke(_pausePollingCheckBox.Checked);
+            if (_pausePollingRequestInProgress)
+            {
+                SetPausePollingCheckedSilently(_confirmedPausePollingState);
+                return;
+            }
+
+            var requestedPauseState = _pausePollingCheckBox.Checked;
+            _pausePollingRequestInProgress = true;
+            SetPausePollingCheckedSilently(_confirmedPausePollingState);
+            RefreshPausePollingEnabledState();
+            EvernotePollingPausedChanged?.Invoke(requestedPauseState);
         };
 
         _pollingLockOwnerLabel = new Label
@@ -129,11 +145,21 @@ internal sealed class SettingsForm : Form
             AutoSize = false,
             Left = 380,
             Top = 152,
-            Width = 300,
+            Width = 210,
             Height = 24,
             ForeColor = Color.DarkRed,
             Text = "Lock: checking..."
         };
+
+        _pollingForceLockButton = new Button
+        {
+            Left = 594,
+            Top = 148,
+            Width = 82,
+            Height = 28,
+            Text = "Force"
+        };
+        _pollingForceLockButton.Click += (_, _) => ForcePollingLockRequested?.Invoke();
 
         _pollingPendingRequestLabel = new Label
         {
@@ -316,6 +342,7 @@ internal sealed class SettingsForm : Form
         Controls.Add(_pollIntervalMinutesNumeric);
         Controls.Add(_pausePollingCheckBox);
         Controls.Add(_pollingLockOwnerLabel);
+        Controls.Add(_pollingForceLockButton);
         Controls.Add(_pollingPendingRequestLabel);
         Controls.Add(_pollingNextStatePollLabel);
         Controls.Add(maxMarkdownLabel);
@@ -354,7 +381,7 @@ internal sealed class SettingsForm : Form
         _pollingPendingRequestLabel.Text = hasPending
             ? $"en attente de confirmation sur {pendingTargetDisplayName}"
             : string.Empty;
-        _pausePollingCheckBox.Enabled = !hasPending;
+        RefreshPausePollingEnabledState();
     }
 
     internal void UpdateNextStatePollInfo(int intervalSeconds, int secondsUntilNextPoll)
@@ -380,6 +407,31 @@ internal sealed class SettingsForm : Form
         {
             _suspendPausePollingChangedEvent = false;
         }
+    }
+
+    internal void ConfirmPausePollingState(bool isPaused)
+    {
+        _confirmedPausePollingState = isPaused;
+        _pausePollingRequestInProgress = false;
+        SetPausePollingCheckedSilently(isPaused);
+        RefreshPausePollingEnabledState();
+    }
+
+    internal void SetPausePollingBusy(bool isBusy)
+    {
+        _pausePollingToggleBusy = isBusy;
+        RefreshPausePollingEnabledState();
+    }
+
+    internal void SetForceLockBusy(bool isBusy)
+    {
+        _pollingForceLockButton.Enabled = !isBusy;
+    }
+
+    private void RefreshPausePollingEnabledState()
+    {
+        var hasPendingLabel = _pollingPendingRequestLabel.Visible;
+        _pausePollingCheckBox.Enabled = !_pausePollingToggleBusy && !_pausePollingRequestInProgress && !hasPendingLabel;
     }
 
     private bool HasSavedOAuthClient()

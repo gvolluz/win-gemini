@@ -74,6 +74,33 @@ internal static partial class GoogleDriveConfigSyncService
         }
     }
 
+    internal static async Task<GoogleDrivePollingStateMetaListResult> ListPollingStateMetasAsync(
+        AppState state,
+        CancellationToken cancellationToken)
+    {
+        if (!IsConfigured(state))
+        {
+            return GoogleDrivePollingStateMetaListResult.Failure("Google Drive sync is not configured.");
+        }
+
+        try
+        {
+            return await ExecuteWithServiceRetryAsync(
+                state,
+                cancellationToken,
+                async service =>
+                {
+                    var appFolderId = await EnsureVisibleAppFolderIdAsync(service, cancellationToken);
+                    var metas = await ListPollingStateFilesMetadataAsync(service, appFolderId, cancellationToken);
+                    return GoogleDrivePollingStateMetaListResult.SuccessResult(metas);
+                });
+        }
+        catch (Exception exception)
+        {
+            return GoogleDrivePollingStateMetaListResult.Failure(exception.Message);
+        }
+    }
+
     internal static async Task<GoogleDrivePollingStateUpsertResult> UpsertPollingStateAsync(
         AppState state,
         string fileName,
@@ -150,6 +177,45 @@ internal static partial class GoogleDriveConfigSyncService
         }
     }
 
+    internal static async Task<GoogleDrivePollingStateDeleteResult> DeleteAllPollingStatesAsync(
+        AppState state,
+        CancellationToken cancellationToken)
+    {
+        if (!IsConfigured(state))
+        {
+            return GoogleDrivePollingStateDeleteResult.Failure("Google Drive sync is not configured.");
+        }
+
+        try
+        {
+            return await ExecuteWithServiceRetryAsync(
+                state,
+                cancellationToken,
+                async service =>
+                {
+                    var appFolderId = await EnsureVisibleAppFolderIdAsync(service, cancellationToken);
+                    var metas = await ListPollingStateFilesMetadataAsync(service, appFolderId, cancellationToken);
+                    var deletedCount = 0;
+                    foreach (var meta in metas)
+                    {
+                        if (string.IsNullOrWhiteSpace(meta.FileId))
+                        {
+                            continue;
+                        }
+
+                        await service.Files.Delete(meta.FileId).ExecuteAsync(cancellationToken);
+                        deletedCount++;
+                    }
+
+                    return GoogleDrivePollingStateDeleteResult.SuccessResult(deletedCount);
+                });
+        }
+        catch (Exception exception)
+        {
+            return GoogleDrivePollingStateDeleteResult.Failure(exception.Message);
+        }
+    }
+
     private static async Task<Google.Apis.Drive.v3.Data.File?> ResolvePollingStateFileAsync(
         DriveService service,
         string parentFolderId,
@@ -184,6 +250,44 @@ internal static partial class GoogleDriveConfigSyncService
 
         var response = await listRequest.ExecuteAsync(cancellationToken);
         return response.Files?.FirstOrDefault();
+    }
+
+    private static async Task<IReadOnlyList<GoogleDrivePollingStateMetaFile>> ListPollingStateFilesMetadataAsync(
+        DriveService service,
+        string appFolderId,
+        CancellationToken cancellationToken)
+    {
+        var listRequest = service.Files.List();
+        listRequest.Fields = "files(id, name, modifiedTime)";
+        listRequest.PageSize = 200;
+        listRequest.Q =
+            $"trashed = false and '{EscapeDriveQueryValue(appFolderId)}' in parents and name contains '{EscapeDriveQueryValue(AppConfig.GoogleDrivePollingStateFilePrefix)}'";
+
+        var response = await listRequest.ExecuteAsync(cancellationToken);
+        var files = response.Files ?? [];
+        var metas = new List<GoogleDrivePollingStateMetaFile>();
+        foreach (var file in files)
+        {
+            if (string.IsNullOrWhiteSpace(file.Id) || string.IsNullOrWhiteSpace(file.Name))
+            {
+                continue;
+            }
+
+            if (!file.Name.StartsWith(AppConfig.GoogleDrivePollingStateFilePrefix, StringComparison.OrdinalIgnoreCase) ||
+                !file.Name.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            metas.Add(new GoogleDrivePollingStateMetaFile
+            {
+                FileId = file.Id,
+                FileName = file.Name,
+                ModifiedTimeUtc = file.ModifiedTimeDateTimeOffset
+            });
+        }
+
+        return metas;
     }
 
     private static async Task<GoogleDrivePollingStateDocument?> DownloadPollingStateDocumentAsync(

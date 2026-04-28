@@ -78,6 +78,18 @@ internal sealed record GoogleDrivePollingStateListResult(
         new(false, [], error);
 }
 
+internal sealed record GoogleDrivePollingStateMetaListResult(
+    bool IsSuccess,
+    IReadOnlyList<GoogleDrivePollingStateMetaFile> States,
+    string? Error)
+{
+    internal static GoogleDrivePollingStateMetaListResult SuccessResult(IReadOnlyList<GoogleDrivePollingStateMetaFile> states) =>
+        new(true, states, null);
+
+    internal static GoogleDrivePollingStateMetaListResult Failure(string error) =>
+        new(false, [], error);
+}
+
 internal sealed record GoogleDrivePollingStateUpsertResult(
     bool IsSuccess,
     string? FileId,
@@ -88,6 +100,25 @@ internal sealed record GoogleDrivePollingStateUpsertResult(
 
     internal static GoogleDrivePollingStateUpsertResult Failure(string error) =>
         new(false, null, error);
+}
+
+internal sealed record GoogleDrivePollingStateDeleteResult(
+    bool IsSuccess,
+    int DeletedFiles,
+    string? Error)
+{
+    internal static GoogleDrivePollingStateDeleteResult SuccessResult(int deletedFiles) =>
+        new(true, deletedFiles, null);
+
+    internal static GoogleDrivePollingStateDeleteResult Failure(string error) =>
+        new(false, 0, error);
+}
+
+internal sealed class GoogleDrivePollingStateMetaFile
+{
+    public string FileId { get; init; } = string.Empty;
+    public string FileName { get; init; } = string.Empty;
+    public DateTimeOffset? ModifiedTimeUtc { get; init; }
 }
 
 internal sealed class GoogleDrivePollingStateFile
