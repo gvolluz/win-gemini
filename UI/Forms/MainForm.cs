@@ -1,5 +1,6 @@
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
+using System.Security.Cryptography;
 
 namespace WinGeminiWrapper;
 
@@ -9,8 +10,10 @@ internal sealed class MainForm : Form
     private const int WindowStateSaveDebounceMs = 350;
     private const int TopBarPollMs = 120;
     private const int GoogleDriveSyncDebounceMs = 1200;
+    private const int PollingLockSyncIntervalMs = 6000;
     private const int EvernoteAutoExportCooldownSeconds = 30;
     private const int TraySyncAnimationIntervalMs = 90;
+    private static readonly TimeSpan PollingLockOwnerStaleThreshold = TimeSpan.FromMinutes(2);
 
     private readonly Panel _webViewHost;
     private readonly Panel _evernoteExportPanel;
@@ -30,6 +33,7 @@ internal sealed class MainForm : Form
     private readonly System.Windows.Forms.Timer _topBarVisibilityTimer;
     private readonly System.Windows.Forms.Timer _evernotePollingTimer;
     private readonly System.Windows.Forms.Timer _googleDriveSyncTimer;
+    private readonly System.Windows.Forms.Timer _pollingLockSyncTimer;
     private readonly System.Windows.Forms.Timer _traySyncAnimationTimer;
     private CoreWebView2Environment? _webViewEnvironment;
     private AppState _appState;
@@ -50,10 +54,30 @@ internal sealed class MainForm : Form
     private bool _balloonShown;
     private bool _logoutInProgress;
     private WrappedApp _currentApp;
+    private readonly string _localMachineHostName;
+    private readonly string _localMachineInstanceSuffix;
+    private readonly string _localMachineInstanceId;
+    private readonly string _localMachineDefaultStateFileName;
+    private readonly string _localMachineSuffixedStateFileName;
+    private string _localMachineStateFileName;
+    private string? _localMachineStateFileId;
+    private string? _lockOwnerInstanceId;
+    private string? _lockOwnerDisplayName;
+    private bool _distributedPollingSyncInProgress;
+    private string? _pendingTakeoverRequestId;
+    private string? _pendingTakeoverTargetInstanceId;
+    private string? _pendingTakeoverTargetDisplayName;
+    private SettingsForm? _settingsFormOpenInstance;
 
     internal MainForm()
     {
         AppLogger.Info("MainForm constructor started.");
+        _localMachineHostName = NormalizeHostName(Environment.MachineName);
+        _localMachineInstanceSuffix = BuildStableInstanceSuffix();
+        _localMachineInstanceId = $"{_localMachineHostName}:{_localMachineInstanceSuffix}";
+        _localMachineDefaultStateFileName = BuildStateFileName(_localMachineHostName, null);
+        _localMachineSuffixedStateFileName = BuildStateFileName(_localMachineHostName, _localMachineInstanceSuffix);
+        _localMachineStateFileName = _localMachineDefaultStateFileName;
         _appState = AppStateStore.Load();
         _appState.Normalize();
         _currentApp = Enum.IsDefined(typeof(WrappedApp), _appState.LastSelectedApp)
@@ -118,6 +142,12 @@ internal sealed class MainForm : Form
         };
         _googleDriveSyncTimer.Tick += GoogleDriveSyncTimer_Tick;
 
+        _pollingLockSyncTimer = new System.Windows.Forms.Timer
+        {
+            Interval = PollingLockSyncIntervalMs
+        };
+        _pollingLockSyncTimer.Tick += PollingLockSyncTimer_Tick;
+
         _traySyncAnimationTimer = new System.Windows.Forms.Timer
         {
             Interval = TraySyncAnimationIntervalMs
@@ -147,6 +177,7 @@ internal sealed class MainForm : Form
             Directory.CreateDirectory(AppConfig.WebViewUserDataFolder);
             Directory.CreateDirectory(AppConfig.AppDataRootFolder);
             await TryAutoRestoreConfigFromGoogleDriveAsync();
+            await SyncDistributedPollingStateAsync(showErrors: false, processIncomingRequests: false);
 
             _currentApp = Enum.IsDefined(typeof(WrappedApp), _appState.LastSelectedApp)
                 ? _appState.LastSelectedApp
@@ -189,9 +220,11 @@ internal sealed class MainForm : Form
         CaptureWindowPlacement();
         QueueAppStateSave();
         _topBarVisibilityTimer.Start();
+        _pollingLockSyncTimer.Start();
         ApplyEvernotePollingSettings();
         LoadEvernoteTreeFromConfiguredRoot(showErrors: false);
         UpdateTopBarVisibility();
+        _ = SyncDistributedPollingStateAsync(showErrors: false, processIncomingRequests: true);
     }
 
     private async Task TryAutoRestoreConfigFromGoogleDriveAsync()
@@ -1728,6 +1761,11 @@ internal sealed class MainForm : Form
         PollEvernoteTracking(allowAutoExport: true, showErrors: false, ignorePause: false);
     }
 
+    private async void PollingLockSyncTimer_Tick(object? sender, EventArgs e)
+    {
+        await SyncDistributedPollingStateAsync(showErrors: false, processIncomingRequests: true);
+    }
+
     private void ApplyEvernotePollingSettings()
     {
         var intervalMinutes = Math.Max(1, _appState.EvernotePollingIntervalMinutes);
@@ -1744,6 +1782,367 @@ internal sealed class MainForm : Form
         {
             _evernotePollingTimer.Start();
         }
+    }
+
+    private async Task SyncDistributedPollingStateAsync(bool showErrors, bool processIncomingRequests)
+    {
+        if (_distributedPollingSyncInProgress)
+        {
+            UpdateSettingsLockStatus();
+            return;
+        }
+
+        if (!GoogleDriveConfigSyncService.IsConfigured(_appState))
+        {
+            _lockOwnerInstanceId = _localMachineInstanceId;
+            _lockOwnerDisplayName = GetLocalDisplayName();
+            UpdateSettingsLockStatus();
+            return;
+        }
+
+        _distributedPollingSyncInProgress = true;
+        try
+        {
+            var listResult = await GoogleDriveConfigSyncService.ListPollingStatesAsync(_appState, CancellationToken.None);
+            if (!listResult.IsSuccess)
+            {
+                if (showErrors && !string.IsNullOrWhiteSpace(listResult.Error))
+                {
+                    MessageBox.Show(
+                        this,
+                        $"Impossible de lire les state files de synchronisation.{Environment.NewLine}{Environment.NewLine}{listResult.Error}",
+                        "Distributed Polling Lock",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                }
+
+                return;
+            }
+
+            var states = listResult.States.ToList();
+            var existingLocalState = states.FirstOrDefault(file =>
+                string.Equals(file.Document.InstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase));
+
+            if (existingLocalState is not null)
+            {
+                _localMachineStateFileId = existingLocalState.FileId;
+                _localMachineStateFileName = existingLocalState.FileName;
+                if (existingLocalState.Document.PendingTakeoverRequest?.IsActive == true &&
+                    string.Equals(existingLocalState.Document.PendingTakeoverRequest.RequestedByInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase))
+                {
+                    _pendingTakeoverRequestId = existingLocalState.Document.PendingTakeoverRequest.RequestId;
+                    _pendingTakeoverTargetInstanceId = existingLocalState.Document.PendingTakeoverRequest.RequestedToInstanceId;
+                    _pendingTakeoverTargetDisplayName = existingLocalState.Document.PendingTakeoverRequest.RequestedToDisplayName;
+                }
+                else
+                {
+                    _pendingTakeoverRequestId = null;
+                    _pendingTakeoverTargetInstanceId = null;
+                    _pendingTakeoverTargetDisplayName = null;
+                }
+            }
+            else
+            {
+                _localMachineStateFileName = ResolveLocalStateFileName(states);
+            }
+
+            var localDocument = BuildLocalPollingStateDocument();
+            var upsertResult = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+                _appState,
+                _localMachineStateFileName,
+                localDocument,
+                _localMachineStateFileId,
+                CancellationToken.None);
+
+            if (!upsertResult.IsSuccess)
+            {
+                if (showErrors && !string.IsNullOrWhiteSpace(upsertResult.Error))
+                {
+                    MessageBox.Show(
+                        this,
+                        $"Impossible de mettre a jour le state local de synchronisation.{Environment.NewLine}{Environment.NewLine}{upsertResult.Error}",
+                        "Distributed Polling Lock",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                }
+
+                return;
+            }
+
+            if (!string.IsNullOrWhiteSpace(upsertResult.FileId))
+            {
+                _localMachineStateFileId = upsertResult.FileId;
+            }
+
+            listResult = await GoogleDriveConfigSyncService.ListPollingStatesAsync(_appState, CancellationToken.None);
+            if (!listResult.IsSuccess)
+            {
+                return;
+            }
+
+            states = listResult.States.ToList();
+            var owner = DeterminePollingLockOwner(states);
+            _lockOwnerInstanceId = owner?.Document.InstanceId;
+            _lockOwnerDisplayName = owner?.Document.DisplayName;
+
+            if (!string.Equals(_lockOwnerInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase) &&
+                !_appState.EvernotePollingPaused)
+            {
+                _appState.EvernotePollingPaused = true;
+                ApplyEvernotePollingSettings();
+                SaveAppStateNow(queueGoogleDriveSync: false);
+                localDocument = BuildLocalPollingStateDocument();
+                var forcedPauseResult = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+                    _appState,
+                    _localMachineStateFileName,
+                    localDocument,
+                    _localMachineStateFileId,
+                    CancellationToken.None);
+                if (forcedPauseResult.IsSuccess && !string.IsNullOrWhiteSpace(forcedPauseResult.FileId))
+                {
+                    _localMachineStateFileId = forcedPauseResult.FileId;
+                }
+            }
+
+            if (processIncomingRequests &&
+                owner is not null &&
+                string.Equals(owner.Document.InstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase) &&
+                !_appState.EvernotePollingPaused)
+            {
+                var didHandle = await TryHandleIncomingTakeoverRequestAsync(states);
+                if (didHandle)
+                {
+                    return;
+                }
+            }
+        }
+        catch (Exception exception)
+        {
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Distributed polling lock sync failed: {exception.Message}");
+            if (showErrors)
+            {
+                MessageBox.Show(
+                    this,
+                    $"Erreur pendant la synchronisation distribuee du verrou de polling.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
+                    "Distributed Polling Lock",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+        }
+        finally
+        {
+            _distributedPollingSyncInProgress = false;
+            UpdateSettingsLockStatus();
+        }
+    }
+
+    private async Task<bool> TryHandleIncomingTakeoverRequestAsync(IReadOnlyCollection<GoogleDrivePollingStateFile> states)
+    {
+        var incomingRequest = states
+            .Where(state => state.Document.PendingTakeoverRequest?.IsActive == true)
+            .Select(state => new { Requester = state, Request = state.Document.PendingTakeoverRequest! })
+            .OrderBy(entry => entry.Request.RequestedAtUtc)
+            .FirstOrDefault(entry =>
+                string.Equals(entry.Request.RequestedToInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase));
+
+        if (incomingRequest is null)
+        {
+            return false;
+        }
+
+        var requesterName = string.IsNullOrWhiteSpace(incomingRequest.Request.RequestedByDisplayName)
+            ? incomingRequest.Requester.Document.DisplayName
+            : incomingRequest.Request.RequestedByDisplayName;
+
+        var decision = MessageBox.Show(
+            this,
+            $"{requesterName} demande la main pour activer la synchronisation automatique.{Environment.NewLine}{Environment.NewLine}Confirmer le transfert ?",
+            "Demande de transfert de verrou",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question);
+
+        var updatedRequesterDocument = ClonePollingStateDocument(incomingRequest.Requester.Document);
+        updatedRequesterDocument.PendingTakeoverRequest = null;
+
+        if (decision == DialogResult.Yes)
+        {
+            _appState.EvernotePollingPaused = true;
+            ApplyEvernotePollingSettings();
+            SaveAppStateNow(queueGoogleDriveSync: false);
+
+            updatedRequesterDocument.PauseAutomaticPolling = false;
+            updatedRequesterDocument.UpdatedAtUtc = DateTimeOffset.UtcNow;
+
+            await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+                _appState,
+                incomingRequest.Requester.FileName,
+                updatedRequesterDocument,
+                incomingRequest.Requester.FileId,
+                CancellationToken.None);
+
+            var updatedLocalDocument = BuildLocalPollingStateDocument();
+            await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+                _appState,
+                _localMachineStateFileName,
+                updatedLocalDocument,
+                _localMachineStateFileId,
+                CancellationToken.None);
+
+            return true;
+        }
+
+        updatedRequesterDocument.PauseAutomaticPolling = true;
+        updatedRequesterDocument.UpdatedAtUtc = DateTimeOffset.UtcNow;
+
+        await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+            _appState,
+            incomingRequest.Requester.FileName,
+            updatedRequesterDocument,
+            incomingRequest.Requester.FileId,
+            CancellationToken.None);
+
+        return true;
+    }
+
+    private GoogleDrivePollingStateFile? DeterminePollingLockOwner(IEnumerable<GoogleDrivePollingStateFile> states)
+    {
+        var now = DateTimeOffset.UtcNow;
+        return states
+            .Where(state => !state.Document.PauseAutomaticPolling)
+            .Where(state =>
+            {
+                var age = now - state.Document.UpdatedAtUtc;
+                return age <= PollingLockOwnerStaleThreshold;
+            })
+            .OrderByDescending(state => state.Document.UpdatedAtUtc)
+            .ThenBy(state => state.Document.InstanceId, StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault();
+    }
+
+    private string ResolveLocalStateFileName(IReadOnlyCollection<GoogleDrivePollingStateFile> states)
+    {
+        var hasAnotherHostState = states.Any(state =>
+            string.Equals(state.Document.HostName, _localMachineHostName, StringComparison.OrdinalIgnoreCase));
+
+        return hasAnotherHostState
+            ? _localMachineSuffixedStateFileName
+            : _localMachineDefaultStateFileName;
+    }
+
+    private GoogleDrivePollingStateDocument BuildLocalPollingStateDocument()
+    {
+        var pendingRequest = BuildPendingTakeoverRequest();
+        return new GoogleDrivePollingStateDocument
+        {
+            InstanceId = _localMachineInstanceId,
+            HostName = _localMachineHostName,
+            DisplayName = GetLocalDisplayName(),
+            PauseAutomaticPolling = _appState.EvernotePollingPaused,
+            UpdatedAtUtc = DateTimeOffset.UtcNow,
+            PendingTakeoverRequest = pendingRequest
+        };
+    }
+
+    private GoogleDrivePollingTakeoverRequest? BuildPendingTakeoverRequest()
+    {
+        if (string.IsNullOrWhiteSpace(_pendingTakeoverRequestId) ||
+            string.IsNullOrWhiteSpace(_pendingTakeoverTargetInstanceId) ||
+            string.IsNullOrWhiteSpace(_pendingTakeoverTargetDisplayName))
+        {
+            return null;
+        }
+
+        return new GoogleDrivePollingTakeoverRequest
+        {
+            RequestId = _pendingTakeoverRequestId,
+            RequestedByInstanceId = _localMachineInstanceId,
+            RequestedByDisplayName = GetLocalDisplayName(),
+            RequestedToInstanceId = _pendingTakeoverTargetInstanceId,
+            RequestedToDisplayName = _pendingTakeoverTargetDisplayName,
+            RequestedAtUtc = DateTimeOffset.UtcNow,
+            IsActive = true
+        };
+    }
+
+    private static GoogleDrivePollingStateDocument ClonePollingStateDocument(GoogleDrivePollingStateDocument source)
+    {
+        return new GoogleDrivePollingStateDocument
+        {
+            InstanceId = source.InstanceId,
+            HostName = source.HostName,
+            DisplayName = source.DisplayName,
+            PauseAutomaticPolling = source.PauseAutomaticPolling,
+            UpdatedAtUtc = DateTimeOffset.UtcNow,
+            PendingTakeoverRequest = source.PendingTakeoverRequest is null
+                ? null
+                : new GoogleDrivePollingTakeoverRequest
+                {
+                    RequestId = source.PendingTakeoverRequest.RequestId,
+                    RequestedByInstanceId = source.PendingTakeoverRequest.RequestedByInstanceId,
+                    RequestedByDisplayName = source.PendingTakeoverRequest.RequestedByDisplayName,
+                    RequestedToInstanceId = source.PendingTakeoverRequest.RequestedToInstanceId,
+                    RequestedToDisplayName = source.PendingTakeoverRequest.RequestedToDisplayName,
+                    RequestedAtUtc = source.PendingTakeoverRequest.RequestedAtUtc,
+                    IsActive = source.PendingTakeoverRequest.IsActive
+                }
+        };
+    }
+
+    private static string NormalizeHostName(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "unknown-host";
+        }
+
+        var normalized = value.Trim();
+        var invalidChars = Path.GetInvalidFileNameChars();
+        foreach (var invalidChar in invalidChars)
+        {
+            normalized = normalized.Replace(invalidChar, '_');
+        }
+
+        return normalized;
+    }
+
+    private static string BuildStateFileName(string hostName, string? suffix)
+    {
+        var sanitizedHost = NormalizeHostName(hostName);
+        var sanitizedSuffix = string.IsNullOrWhiteSpace(suffix)
+            ? null
+            : suffix.Trim();
+
+        return string.IsNullOrWhiteSpace(sanitizedSuffix)
+            ? $"{AppConfig.GoogleDrivePollingStateFilePrefix}{sanitizedHost}.json"
+            : $"{AppConfig.GoogleDrivePollingStateFilePrefix}{sanitizedHost}_{sanitizedSuffix}.json";
+    }
+
+    private static string BuildStableInstanceSuffix()
+    {
+        var source = Path.GetFullPath(AppContext.BaseDirectory).ToUpperInvariant();
+        var hashBytes = SHA1.HashData(System.Text.Encoding.UTF8.GetBytes(source));
+        return Convert.ToHexString(hashBytes).Substring(0, 6).ToLowerInvariant();
+    }
+
+    private string GetLocalDisplayName()
+    {
+        return string.Equals(_localMachineStateFileName, _localMachineDefaultStateFileName, StringComparison.OrdinalIgnoreCase)
+            ? _localMachineHostName
+            : $"{_localMachineHostName}_{_localMachineInstanceSuffix}";
+    }
+
+    private void UpdateSettingsLockStatus()
+    {
+        if (_settingsFormOpenInstance is null || _settingsFormOpenInstance.IsDisposed)
+        {
+            _settingsFormOpenInstance = null;
+            return;
+        }
+
+        var owner = string.IsNullOrWhiteSpace(_lockOwnerDisplayName) ? "(none)" : _lockOwnerDisplayName;
+        var isLocalOwner = string.Equals(_lockOwnerInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase);
+        _settingsFormOpenInstance.UpdatePollingLockStatus(owner, isLocalOwner);
+        _settingsFormOpenInstance.UpdatePendingPollingRequest(_pendingTakeoverTargetDisplayName);
     }
 
     private void ResetEvernoteTrackingBaseline()
@@ -2226,7 +2625,7 @@ internal sealed class MainForm : Form
         }
     }
 
-    private void OpenSettings()
+    private async void OpenSettings()
     {
         var pausedBeforeDialog = _appState.EvernotePollingPaused;
         var settingsImported = false;
@@ -2240,6 +2639,9 @@ internal sealed class MainForm : Form
             _appState.GoogleDriveClientId,
             _appState.GoogleDriveClientSecret,
             _appState.GoogleDriveConfigFileId);
+        _settingsFormOpenInstance = settingsForm;
+        UpdateSettingsLockStatus();
+        await SyncDistributedPollingStateAsync(showErrors: false, processIncomingRequests: false);
         settingsForm.EvernotePollingPausedChanged += isPaused => RefreshTrayPollingIconState(isPaused);
         settingsForm.ExportSettingsRequested += () => ExportSettingsWithDialog(settingsForm);
         settingsForm.ImportSettingsRequested += () =>
@@ -2260,10 +2662,12 @@ internal sealed class MainForm : Form
                 RefreshTrayPollingIconState(pausedBeforeDialog);
             }
 
+            _settingsFormOpenInstance = null;
             return;
         }
 
         var stateChanged = false;
+        var requestedUnpauseWithoutLock = false;
 
         if (settingsForm.SelectedCloseButtonBehavior != _appState.CloseButtonBehavior)
         {
@@ -2279,8 +2683,30 @@ internal sealed class MainForm : Form
 
         if (settingsForm.IsEvernotePollingPaused != _appState.EvernotePollingPaused)
         {
-            _appState.EvernotePollingPaused = settingsForm.IsEvernotePollingPaused;
-            stateChanged = true;
+            var wantsPollingActive = !settingsForm.IsEvernotePollingPaused;
+            var localOwnsLock = string.Equals(_lockOwnerInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase);
+            var noCurrentOwner = string.IsNullOrWhiteSpace(_lockOwnerInstanceId);
+            if (wantsPollingActive && !localOwnsLock && !noCurrentOwner)
+            {
+                requestedUnpauseWithoutLock = true;
+                _appState.EvernotePollingPaused = true;
+                _pendingTakeoverRequestId = Guid.NewGuid().ToString("N");
+                _pendingTakeoverTargetInstanceId = _lockOwnerInstanceId;
+                _pendingTakeoverTargetDisplayName = _lockOwnerDisplayName;
+                stateChanged = true;
+            }
+            else
+            {
+                _appState.EvernotePollingPaused = settingsForm.IsEvernotePollingPaused;
+                if (_appState.EvernotePollingPaused)
+                {
+                    _pendingTakeoverRequestId = null;
+                    _pendingTakeoverTargetInstanceId = null;
+                    _pendingTakeoverTargetDisplayName = null;
+                }
+
+                stateChanged = true;
+            }
         }
 
         if (settingsForm.SelectedMaxMarkdownFilesToKeep != _appState.MaxMarkdownFilesToKeep)
@@ -2322,12 +2748,25 @@ internal sealed class MainForm : Form
         if (!stateChanged)
         {
             RefreshTrayPollingIconState();
+            _settingsFormOpenInstance = null;
             return;
         }
 
         ApplyEvernotePollingSettings();
         SaveAppStateNow(queueGoogleDriveSync: false);
+        await SyncDistributedPollingStateAsync(showErrors: true, processIncomingRequests: false);
         _ = SyncConfigToGoogleDriveAsync(showErrors: true);
+        _settingsFormOpenInstance = null;
+
+        if (requestedUnpauseWithoutLock && !string.IsNullOrWhiteSpace(_pendingTakeoverTargetDisplayName))
+        {
+            MessageBox.Show(
+                this,
+                $"en attente de confirmation sur {_pendingTakeoverTargetDisplayName}",
+                "Demande en attente",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
     }
 
     private void ExportSettingsWithDialog(IWin32Window owner)
@@ -2637,6 +3076,7 @@ internal sealed class MainForm : Form
         if (disposing)
         {
             _traySyncAnimationTimer.Dispose();
+            _pollingLockSyncTimer.Dispose();
             _googleDriveSyncTimer.Dispose();
             _evernotePollingTimer.Dispose();
             _topBarVisibilityTimer.Dispose();

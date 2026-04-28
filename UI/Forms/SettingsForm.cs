@@ -5,6 +5,8 @@ internal sealed class SettingsForm : Form
     private readonly ComboBox _closeBehaviorComboBox;
     private readonly NumericUpDown _pollIntervalMinutesNumeric;
     private readonly CheckBox _pausePollingCheckBox;
+    private readonly Label _pollingLockOwnerLabel;
+    private readonly Label _pollingPendingRequestLabel;
     private readonly NumericUpDown _maxMarkdownFilesNumeric;
     private readonly CheckBox _googleDriveSyncEnabledCheckBox;
     private readonly CheckBox _googleDriveAutoRestoreCheckBox;
@@ -53,7 +55,7 @@ internal sealed class SettingsForm : Form
         MinimizeBox = false;
         MaximizeBox = false;
         ShowInTaskbar = false;
-        ClientSize = new Size(700, 580);
+        ClientSize = new Size(700, 610);
         Icon = AppIconProvider.GetIcon();
 
         var closeBehaviorLabel = new Label
@@ -106,24 +108,47 @@ internal sealed class SettingsForm : Form
         {
             Left = 152,
             Top = 150,
-            Width = 344,
+            Width = 220,
             Text = "Pause automatic polling",
             Checked = currentEvernotePollingPaused
         };
         _pausePollingCheckBox.CheckedChanged += (_, _) => EvernotePollingPausedChanged?.Invoke(_pausePollingCheckBox.Checked);
 
+        _pollingLockOwnerLabel = new Label
+        {
+            AutoSize = false,
+            Left = 380,
+            Top = 152,
+            Width = 300,
+            Height = 24,
+            ForeColor = Color.DarkRed,
+            Text = "Lock: checking..."
+        };
+
+        _pollingPendingRequestLabel = new Label
+        {
+            AutoSize = false,
+            Left = 152,
+            Top = 172,
+            Width = 520,
+            Height = 24,
+            ForeColor = Color.DarkOrange,
+            Text = string.Empty,
+            Visible = false
+        };
+
         var maxMarkdownLabel = new Label
         {
             AutoSize = true,
             Left = 16,
-            Top = 188,
+            Top = 206,
             Text = "Keep last X markdown exports:"
         };
 
         _maxMarkdownFilesNumeric = new NumericUpDown
         {
             Left = 16,
-            Top = 214,
+            Top = 232,
             Width = 120,
             Minimum = 1,
             Maximum = 1000,
@@ -133,7 +158,7 @@ internal sealed class SettingsForm : Form
         var evernoteHelpLabel = new Label
         {
             Left = 152,
-            Top = 216,
+            Top = 234,
             Width = 530,
             Height = 36,
             Text = "Older files in ./markdown will be deleted automatically after each export."
@@ -143,7 +168,7 @@ internal sealed class SettingsForm : Form
         {
             AutoSize = true,
             Left = 16,
-            Top = 262,
+            Top = 280,
             Text = $"Local config file: {AppConfig.LocalConfigFilePath}"
         };
 
@@ -151,7 +176,7 @@ internal sealed class SettingsForm : Form
         {
             AutoSize = true,
             Left = 16,
-            Top = 292,
+            Top = 310,
             Font = new Font(Font, FontStyle.Bold),
             Text = "Google Drive config sync"
         };
@@ -159,7 +184,7 @@ internal sealed class SettingsForm : Form
         _googleDriveSyncEnabledCheckBox = new CheckBox
         {
             Left = 16,
-            Top = 320,
+            Top = 338,
             Width = 330,
             Text = "Enable Google Drive sync",
             Checked = currentGoogleDriveSyncEnabled
@@ -168,7 +193,7 @@ internal sealed class SettingsForm : Form
         _googleDriveAutoRestoreCheckBox = new CheckBox
         {
             Left = 360,
-            Top = 320,
+            Top = 338,
             Width = 280,
             Text = "Auto-restore at startup",
             Checked = currentGoogleDriveAutoRestoreOnStartup
@@ -177,7 +202,7 @@ internal sealed class SettingsForm : Form
         var oauthHintLabel = new Label
         {
             Left = 16,
-            Top = 352,
+            Top = 370,
             Width = 660,
             Height = 36,
             Text = "Clique sur le bouton ci-dessous: une fenetre Google OAuth standard s'ouvre pour te connecter."
@@ -187,7 +212,7 @@ internal sealed class SettingsForm : Form
         {
             AutoSize = true,
             Left = 16,
-            Top = 392,
+            Top = 410,
             Width = 220,
             Text = "Se connecter avec Google"
         };
@@ -196,7 +221,7 @@ internal sealed class SettingsForm : Form
         _googleOAuthStatusLabel = new Label
         {
             Left = 252,
-            Top = 398,
+            Top = 416,
             Width = 424,
             Height = 32,
             Text = HasSavedOAuthClient() ? "OAuth status: configured." : "OAuth status: not connected."
@@ -205,7 +230,7 @@ internal sealed class SettingsForm : Form
         _googleOAuthClientSourceLabel = new Label
         {
             Left = 16,
-            Top = 432,
+            Top = 450,
             Width = 660,
             Height = 32,
             Text = $"OAuth client source: {(File.Exists(AppConfig.GoogleDriveOAuthClientJsonPath) ? AppConfig.GoogleDriveOAuthClientJsonPath : "(not detected)")}"
@@ -215,14 +240,14 @@ internal sealed class SettingsForm : Form
         {
             AutoSize = true,
             Left = 16,
-            Top = 470,
+            Top = 488,
             Text = "Drive file ID (optional):"
         };
 
         _googleDriveFileIdTextBox = new TextBox
         {
             Left = 16,
-            Top = 492,
+            Top = 510,
             Width = 660,
             Text = currentGoogleDriveConfigFileId ?? string.Empty
         };
@@ -232,7 +257,7 @@ internal sealed class SettingsForm : Form
             Text = "Save",
             DialogResult = DialogResult.OK,
             Left = 500,
-            Top = 532,
+            Top = 546,
             Width = 80
         };
 
@@ -241,7 +266,7 @@ internal sealed class SettingsForm : Form
             Text = "Cancel",
             DialogResult = DialogResult.Cancel,
             Left = 588,
-            Top = 532,
+            Top = 546,
             Width = 80
         };
 
@@ -249,7 +274,7 @@ internal sealed class SettingsForm : Form
         {
             Text = "Export settings",
             Left = 16,
-            Top = 532,
+            Top = 546,
             Width = 130
         };
         exportButton.Click += (_, _) => ExportSettingsRequested?.Invoke();
@@ -258,7 +283,7 @@ internal sealed class SettingsForm : Form
         {
             Text = "Import settings",
             Left = 154,
-            Top = 532,
+            Top = 546,
             Width = 130
         };
         importButton.Click += (_, _) => ImportSettingsRequested?.Invoke();
@@ -269,6 +294,8 @@ internal sealed class SettingsForm : Form
         Controls.Add(pollingLabel);
         Controls.Add(_pollIntervalMinutesNumeric);
         Controls.Add(_pausePollingCheckBox);
+        Controls.Add(_pollingLockOwnerLabel);
+        Controls.Add(_pollingPendingRequestLabel);
         Controls.Add(maxMarkdownLabel);
         Controls.Add(_maxMarkdownFilesNumeric);
         Controls.Add(evernoteHelpLabel);
@@ -289,6 +316,23 @@ internal sealed class SettingsForm : Form
 
         AcceptButton = saveButton;
         CancelButton = cancelButton;
+    }
+
+    internal void UpdatePollingLockStatus(string? lockOwnerDisplayName, bool isOwnedByCurrentHost)
+    {
+        var ownerLabel = string.IsNullOrWhiteSpace(lockOwnerDisplayName) ? "(none)" : lockOwnerDisplayName.Trim();
+        _pollingLockOwnerLabel.Text = $"Lock: {ownerLabel}";
+        _pollingLockOwnerLabel.ForeColor = isOwnedByCurrentHost ? Color.DarkGreen : Color.DarkRed;
+    }
+
+    internal void UpdatePendingPollingRequest(string? pendingTargetDisplayName)
+    {
+        var hasPending = !string.IsNullOrWhiteSpace(pendingTargetDisplayName);
+        _pollingPendingRequestLabel.Visible = hasPending;
+        _pollingPendingRequestLabel.Text = hasPending
+            ? $"en attente de confirmation sur {pendingTargetDisplayName}"
+            : string.Empty;
+        _pausePollingCheckBox.Enabled = !hasPending;
     }
 
     private bool HasSavedOAuthClient()
