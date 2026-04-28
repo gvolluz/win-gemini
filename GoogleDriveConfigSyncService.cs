@@ -336,7 +336,7 @@ internal static class GoogleDriveConfigSyncService
 
                         if (file.ConvertToGoogleDoc)
                         {
-                            await CreateOrReplaceGoogleDocumentFromMarkdownAsync(
+                            await UploadOrUpdateGoogleDocumentFromMarkdownAsync(
                                 service,
                                 targetParentFolderId,
                                 file.LocalFilePath,
@@ -628,7 +628,7 @@ internal static class GoogleDriveConfigSyncService
         }
     }
 
-    private static async Task CreateOrReplaceGoogleDocumentFromMarkdownAsync(
+    private static async Task UploadOrUpdateGoogleDocumentFromMarkdownAsync(
         DriveService service,
         string parentFolderId,
         string localFilePath,
@@ -643,38 +643,41 @@ internal static class GoogleDriveConfigSyncService
         var escapedName = EscapeDriveQueryValue(googleDocName);
         var escapedParent = EscapeDriveQueryValue(parentFolderId);
         var listRequest = service.Files.List();
-        listRequest.Fields = "files(id)";
-        listRequest.PageSize = 100;
+        listRequest.Fields = "files(id, createdTime)";
+        listRequest.PageSize = 20;
+        listRequest.OrderBy = "createdTime asc";
         listRequest.Q =
             $"mimeType = '{GoogleDocumentMimeType}' and name = '{escapedName}' and trashed = false and '{escapedParent}' in parents";
 
         var existing = await listRequest.ExecuteAsync(cancellationToken);
-        foreach (var existingDoc in existing.Files ?? [])
-        {
-            if (string.IsNullOrWhiteSpace(existingDoc.Id))
-            {
-                continue;
-            }
-
-            try
-            {
-                await service.Files.Delete(existingDoc.Id).ExecuteAsync(cancellationToken);
-            }
-            catch (GoogleApiException exception) when (exception.HttpStatusCode == HttpStatusCode.NotFound)
-            {
-                // Already removed; continue.
-            }
-        }
+        var existingDoc = existing.Files?.FirstOrDefault(file => !string.IsNullOrWhiteSpace(file.Id));
 
         await using var markdownStream = new FileStream(localFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
-        var metadata = new Google.Apis.Drive.v3.Data.File
+        if (existingDoc is not null && !string.IsNullOrWhiteSpace(existingDoc.Id))
+        {
+            var updateMetadata = new Google.Apis.Drive.v3.Data.File
+            {
+                Name = googleDocName
+            };
+            var updateRequest = service.Files.Update(updateMetadata, existingDoc.Id, markdownStream, MarkdownMimeType);
+            updateRequest.Fields = "id, modifiedTime";
+            var updateResult = await updateRequest.UploadAsync(cancellationToken);
+            if (updateResult.Status != Google.Apis.Upload.UploadStatus.Completed)
+            {
+                throw updateResult.Exception ?? new InvalidOperationException("Google Doc update failed.");
+            }
+
+            return;
+        }
+
+        var createMetadata = new Google.Apis.Drive.v3.Data.File
         {
             Name = googleDocName,
             MimeType = GoogleDocumentMimeType,
             Parents = [parentFolderId]
         };
 
-        var createRequest = service.Files.Create(metadata, markdownStream, MarkdownMimeType);
+        var createRequest = service.Files.Create(createMetadata, markdownStream, MarkdownMimeType);
         createRequest.Fields = "id, modifiedTime";
         var createResult = await createRequest.UploadAsync(cancellationToken);
         if (createResult.Status != Google.Apis.Upload.UploadStatus.Completed)
