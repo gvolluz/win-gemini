@@ -131,8 +131,10 @@ internal static partial class GoogleDriveConfigSyncService
                 async service =>
                 {
                     var appFolderId = await EnsureVisibleAppFolderIdAsync(service, cancellationToken);
-                    var target = await ResolvePollingStateFileAsync(service, appFolderId, fileName, preferredFileId, cancellationToken);
+                    var candidates = await ListPollingStateFilesByExactNameAsync(service, appFolderId, fileName, cancellationToken);
+                    var target = ResolvePreferredPollingStateFile(candidates, preferredFileId);
                     var payload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(document, PollingStateJsonOptions));
+                    string targetFileId;
 
                     if (target is null || string.IsNullOrWhiteSpace(target.Id))
                     {
@@ -151,24 +153,39 @@ internal static partial class GoogleDriveConfigSyncService
                             return GoogleDrivePollingStateUpsertResult.Failure(upload.Exception?.Message ?? "Upload did not complete.");
                         }
 
-                        return GoogleDrivePollingStateUpsertResult.SuccessResult(createRequest.ResponseBody.Id);
+                        targetFileId = createRequest.ResponseBody.Id;
+                    }
+                    else
+                    {
+                        using var updateStream = new MemoryStream(payload);
+                        var updateMetadata = new Google.Apis.Drive.v3.Data.File
+                        {
+                            Name = fileName,
+                            MimeType = ConfigMimeType
+                        };
+                        var updateRequest = service.Files.Update(updateMetadata, target.Id, updateStream, ConfigMimeType);
+                        updateRequest.Fields = "id";
+                        var updated = await updateRequest.UploadAsync(cancellationToken);
+                        if (updated.Status != Google.Apis.Upload.UploadStatus.Completed || updateRequest.ResponseBody is null)
+                        {
+                            return GoogleDrivePollingStateUpsertResult.Failure(updated.Exception?.Message ?? "Upload did not complete.");
+                        }
+
+                        targetFileId = updateRequest.ResponseBody.Id;
                     }
 
-                    using var updateStream = new MemoryStream(payload);
-                    var updateMetadata = new Google.Apis.Drive.v3.Data.File
+                    var deleteDuplicatesResult = await DeleteDuplicatePollingStateFilesByNameAsync(
+                        service,
+                        appFolderId,
+                        fileName,
+                        targetFileId,
+                        cancellationToken);
+                    if (!deleteDuplicatesResult.IsSuccess)
                     {
-                        Name = fileName,
-                        MimeType = ConfigMimeType
-                    };
-                    var updateRequest = service.Files.Update(updateMetadata, target.Id, updateStream, ConfigMimeType);
-                    updateRequest.Fields = "id";
-                    var updated = await updateRequest.UploadAsync(cancellationToken);
-                    if (updated.Status != Google.Apis.Upload.UploadStatus.Completed || updateRequest.ResponseBody is null)
-                    {
-                        return GoogleDrivePollingStateUpsertResult.Failure(updated.Exception?.Message ?? "Upload did not complete.");
+                        return GoogleDrivePollingStateUpsertResult.Failure(deleteDuplicatesResult.Error ?? "Failed to delete duplicate state files.");
                     }
 
-                    return GoogleDrivePollingStateUpsertResult.SuccessResult(updateRequest.ResponseBody.Id);
+                    return GoogleDrivePollingStateUpsertResult.SuccessResult(targetFileId);
                 });
         }
         catch (Exception exception)
@@ -216,40 +233,71 @@ internal static partial class GoogleDriveConfigSyncService
         }
     }
 
-    private static async Task<Google.Apis.Drive.v3.Data.File?> ResolvePollingStateFileAsync(
-        DriveService service,
-        string parentFolderId,
-        string fileName,
-        string? preferredFileId,
-        CancellationToken cancellationToken)
+    private static Google.Apis.Drive.v3.Data.File? ResolvePreferredPollingStateFile(
+        IReadOnlyList<Google.Apis.Drive.v3.Data.File> candidates,
+        string? preferredFileId)
     {
-        if (!string.IsNullOrWhiteSpace(preferredFileId))
+        if (!string.IsNullOrWhiteSpace(preferredFileId) && candidates.Count > 0)
         {
-            try
+            var preferred = candidates.FirstOrDefault(file =>
+                string.Equals(file.Id, preferredFileId, StringComparison.OrdinalIgnoreCase));
+            if (preferred is not null)
             {
-                var getRequest = service.Files.Get(preferredFileId);
-                getRequest.Fields = "id, name, parents";
-                var preferred = await getRequest.ExecuteAsync(cancellationToken);
-                if (preferred?.Parents?.Any(parent => string.Equals(parent, parentFolderId, StringComparison.Ordinal)) == true)
-                {
-                    return preferred;
-                }
-            }
-            catch
-            {
-                // Fallback to name lookup below.
+                return preferred;
             }
         }
 
+        return candidates
+            .OrderByDescending(file => file.ModifiedTimeDateTimeOffset)
+            .FirstOrDefault();
+    }
+
+    private static async Task<IReadOnlyList<Google.Apis.Drive.v3.Data.File>> ListPollingStateFilesByExactNameAsync(
+        DriveService service,
+        string parentFolderId,
+        string fileName,
+        CancellationToken cancellationToken)
+    {
         var listRequest = service.Files.List();
         listRequest.Fields = "files(id, name, modifiedTime)";
-        listRequest.PageSize = 1;
+        listRequest.PageSize = 200;
         listRequest.OrderBy = "modifiedTime desc";
         listRequest.Q =
             $"name = '{EscapeDriveQueryValue(fileName)}' and trashed = false and '{EscapeDriveQueryValue(parentFolderId)}' in parents";
 
         var response = await listRequest.ExecuteAsync(cancellationToken);
-        return response.Files?.FirstOrDefault();
+        return response.Files?.ToList() ?? [];
+    }
+
+    private static async Task<GoogleDrivePollingStateDeleteResult> DeleteDuplicatePollingStateFilesByNameAsync(
+        DriveService service,
+        string parentFolderId,
+        string fileName,
+        string keepFileId,
+        CancellationToken cancellationToken)
+    {
+        var candidates = await ListPollingStateFilesByExactNameAsync(service, parentFolderId, fileName, cancellationToken);
+        var toDelete = candidates
+            .Where(file => !string.IsNullOrWhiteSpace(file.Id))
+            .Where(file => !string.Equals(file.Id, keepFileId, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        var deletedCount = 0;
+        foreach (var file in toDelete)
+        {
+            try
+            {
+                await service.Files.Delete(file.Id).ExecuteAsync(cancellationToken);
+                deletedCount++;
+            }
+            catch (Exception exception)
+            {
+                return GoogleDrivePollingStateDeleteResult.Failure(
+                    $"Failed deleting duplicate state file '{fileName}' (id={file.Id}): {exception.Message}");
+            }
+        }
+
+        return GoogleDrivePollingStateDeleteResult.SuccessResult(deletedCount);
     }
 
     private static async Task<IReadOnlyList<GoogleDrivePollingStateMetaFile>> ListPollingStateFilesMetadataAsync(
