@@ -16,6 +16,8 @@ internal sealed class SettingsForm : Form
     private string? _googleDriveClientIdValue;
     private string? _googleDriveClientSecretValue;
     internal event Action<bool>? EvernotePollingPausedChanged;
+    internal event Action? ExportSettingsRequested;
+    internal event Action? ImportSettingsRequested;
 
     internal CloseButtonBehavior SelectedCloseButtonBehavior =>
         _closeBehaviorComboBox.SelectedIndex == 1
@@ -243,6 +245,24 @@ internal sealed class SettingsForm : Form
             Width = 80
         };
 
+        var exportButton = new Button
+        {
+            Text = "Export settings",
+            Left = 16,
+            Top = 532,
+            Width = 130
+        };
+        exportButton.Click += (_, _) => ExportSettingsRequested?.Invoke();
+
+        var importButton = new Button
+        {
+            Text = "Import settings",
+            Left = 154,
+            Top = 532,
+            Width = 130
+        };
+        importButton.Click += (_, _) => ImportSettingsRequested?.Invoke();
+
         Controls.Add(closeBehaviorLabel);
         Controls.Add(_closeBehaviorComboBox);
         Controls.Add(helpTextLabel);
@@ -262,6 +282,8 @@ internal sealed class SettingsForm : Form
         Controls.Add(_googleOAuthClientSourceLabel);
         Controls.Add(driveFileIdLabel);
         Controls.Add(_googleDriveFileIdTextBox);
+        Controls.Add(exportButton);
+        Controls.Add(importButton);
         Controls.Add(saveButton);
         Controls.Add(cancelButton);
 

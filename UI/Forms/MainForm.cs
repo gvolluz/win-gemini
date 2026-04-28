@@ -254,6 +254,7 @@ internal sealed class MainForm : Form
         remoteState.GoogleDriveSyncEnabled = localFallbackState.GoogleDriveSyncEnabled || remoteState.GoogleDriveSyncEnabled;
         remoteState.GoogleDriveAutoRestoreOnStartup =
             localFallbackState.GoogleDriveAutoRestoreOnStartup || remoteState.GoogleDriveAutoRestoreOnStartup;
+        ApplyMachineLocalEvernoteSettings(source: localFallbackState, target: remoteState);
 
         _appState = remoteState;
         _appState.Normalize();
@@ -2148,7 +2149,8 @@ internal sealed class MainForm : Form
         _googleDriveSyncInProgress = true;
         try
         {
-            var json = AppStateStore.Serialize(_appState);
+            var syncState = CreateSharedSyncState(_appState);
+            var json = AppStateStore.Serialize(syncState);
             var uploadResult = await GoogleDriveConfigSyncService.UploadConfigAsync(
                 _appState,
                 json,
@@ -2227,6 +2229,7 @@ internal sealed class MainForm : Form
     private void OpenSettings()
     {
         var pausedBeforeDialog = _appState.EvernotePollingPaused;
+        var settingsImported = false;
         using var settingsForm = new SettingsForm(
             _appState.CloseButtonBehavior,
             _appState.EvernotePollingIntervalMinutes,
@@ -2238,9 +2241,25 @@ internal sealed class MainForm : Form
             _appState.GoogleDriveClientSecret,
             _appState.GoogleDriveConfigFileId);
         settingsForm.EvernotePollingPausedChanged += isPaused => RefreshTrayPollingIconState(isPaused);
+        settingsForm.ExportSettingsRequested += () => ExportSettingsWithDialog(settingsForm);
+        settingsForm.ImportSettingsRequested += () =>
+        {
+            if (!ImportSettingsWithDialog(settingsForm))
+            {
+                return;
+            }
+
+            settingsImported = true;
+            settingsForm.DialogResult = DialogResult.Cancel;
+            settingsForm.Close();
+        };
         if (settingsForm.ShowDialog(this) != DialogResult.OK)
         {
-            RefreshTrayPollingIconState(pausedBeforeDialog);
+            if (!settingsImported)
+            {
+                RefreshTrayPollingIconState(pausedBeforeDialog);
+            }
+
             return;
         }
 
@@ -2309,6 +2328,143 @@ internal sealed class MainForm : Form
         ApplyEvernotePollingSettings();
         SaveAppStateNow(queueGoogleDriveSync: false);
         _ = SyncConfigToGoogleDriveAsync(showErrors: true);
+    }
+
+    private void ExportSettingsWithDialog(IWin32Window owner)
+    {
+        using var dialog = new SaveFileDialog
+        {
+            Title = "Export settings",
+            Filter = "JSON files (*.json)|*.json|All files (*.*)|*.*",
+            FileName = $"WinGemini-settings-{DateTime.Now:yyyyMMdd-HHmmss}.json",
+            AddExtension = true,
+            DefaultExt = "json",
+            OverwritePrompt = true
+        };
+
+        if (dialog.ShowDialog(owner) != DialogResult.OK || string.IsNullOrWhiteSpace(dialog.FileName))
+        {
+            return;
+        }
+
+        try
+        {
+            var json = AppStateStore.Serialize(_appState);
+            File.WriteAllText(dialog.FileName, json);
+            MessageBox.Show(
+                owner,
+                $"Settings exported to:{Environment.NewLine}{dialog.FileName}",
+                "Settings export",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show(
+                owner,
+                $"Unable to export settings.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
+                "Settings export",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
+    }
+
+    private bool ImportSettingsWithDialog(IWin32Window owner)
+    {
+        if (MessageBox.Show(
+                owner,
+                "Importing a settings file will replace your current local configuration. Continue?",
+                "Import settings",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning) != DialogResult.Yes)
+        {
+            return false;
+        }
+
+        using var dialog = new OpenFileDialog
+        {
+            Title = "Import settings",
+            Filter = "JSON files (*.json)|*.json|All files (*.*)|*.*",
+            CheckFileExists = true,
+            Multiselect = false
+        };
+
+        if (dialog.ShowDialog(owner) != DialogResult.OK || string.IsNullOrWhiteSpace(dialog.FileName))
+        {
+            return false;
+        }
+
+        string json;
+        try
+        {
+            json = File.ReadAllText(dialog.FileName);
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show(
+                owner,
+                $"Unable to read the selected file.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
+                "Import settings",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            return false;
+        }
+
+        if (!AppStateStore.TryDeserialize(json, out var importedState))
+        {
+            MessageBox.Show(
+                owner,
+                "The selected file does not contain valid settings JSON.",
+                "Import settings",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            return false;
+        }
+
+        ApplyMachineLocalEvernoteSettings(source: _appState, target: importedState);
+        _appState = importedState;
+        _appState.Normalize();
+
+        var selectedApp = Enum.IsDefined(typeof(WrappedApp), _appState.LastSelectedApp)
+            ? _appState.LastSelectedApp
+            : AppConfig.DefaultApp;
+        if (_appSwitcher.SelectedIndex != (int)selectedApp)
+        {
+            _appSwitcher.SelectedIndex = (int)selectedApp;
+        }
+
+        _evernoteDbPathTextBox.Text = GetConfiguredEvernoteRootPath() ?? string.Empty;
+        SyncEvernoteShowIgnoredCheckboxFromState();
+        ApplyEvernotePollingSettings();
+        UpdateAppChrome();
+        LoadEvernoteTreeFromConfiguredRoot(showErrors: false, refreshTracking: false);
+        SaveAppStateNow(queueGoogleDriveSync: false);
+        _ = SyncConfigToGoogleDriveAsync(showErrors: true);
+
+        MessageBox.Show(
+            owner,
+            $"Settings imported from:{Environment.NewLine}{dialog.FileName}",
+            "Import settings",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Information);
+        return true;
+    }
+
+    private static AppState CreateSharedSyncState(AppState source)
+    {
+        var cloned = AppStateStore.Deserialize(AppStateStore.Serialize(source));
+        cloned.EvernoteLocalDbPath = null;
+        cloned.EvernotePollingPaused = false;
+        cloned.EvernotePollingIntervalMinutes = AppState.DefaultEvernotePollingIntervalMinutes;
+        cloned.Normalize();
+        return cloned;
+    }
+
+    private static void ApplyMachineLocalEvernoteSettings(AppState source, AppState target)
+    {
+        target.EvernoteLocalDbPath = source.EvernoteLocalDbPath;
+        target.EvernotePollingPaused = source.EvernotePollingPaused;
+        target.EvernotePollingIntervalMinutes = source.EvernotePollingIntervalMinutes;
     }
 
     private async Task LogoutAsync()
