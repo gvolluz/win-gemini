@@ -1855,6 +1855,19 @@ internal sealed class MainForm : Form
                     _pendingTakeoverTargetInstanceId = existingLocalState.Document.PendingTakeoverRequest.RequestedToInstanceId;
                     _pendingTakeoverTargetDisplayName = existingLocalState.Document.PendingTakeoverRequest.RequestedToDisplayName;
                 }
+
+                // If remote already reflects an approved takeover, avoid re-writing an old pending request locally.
+                if (!string.IsNullOrWhiteSpace(_pendingTakeoverRequestId) &&
+                    existingLocalState.Document.PendingTakeoverRequest is null &&
+                    !existingLocalState.Document.PauseAutomaticPolling)
+                {
+                    _appState.EvernotePollingPaused = false;
+                    _pendingTakeoverRequestId = null;
+                    _pendingTakeoverTargetInstanceId = null;
+                    _pendingTakeoverTargetDisplayName = null;
+                    _pendingTakeoverMissingObservationCount = 0;
+                    LogPollingLock("Remote state indicates takeover already approved; adopting active local state before upsert.");
+                }
             }
             else
             {
@@ -2311,7 +2324,9 @@ internal sealed class MainForm : Form
 
     private void LogPollingLock(string message)
     {
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [PollingLock:{_localMachineInstanceId}] {message}");
+        var line = $"[PollingLock:{_localMachineInstanceId}] {message}";
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {line}");
+        AppLogger.Info(line);
     }
 
     private string DescribePendingLocalRequest()
