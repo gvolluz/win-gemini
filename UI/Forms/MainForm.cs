@@ -231,6 +231,7 @@ internal sealed class MainForm : Form
         QueueAppStateSave();
         _topBarVisibilityTimer.Start();
         _pollingLockSyncTimer.Start();
+        _nextPollingStateSyncAtUtc = DateTimeOffset.UtcNow.AddMilliseconds(_pollingLockSyncTimer.Interval);
         _settingsUiRefreshTimer.Start();
         ApplyEvernotePollingSettings();
         LoadEvernoteTreeFromConfiguredRoot(showErrors: false);
@@ -1847,12 +1848,6 @@ internal sealed class MainForm : Form
                     _pendingTakeoverTargetInstanceId = existingLocalState.Document.PendingTakeoverRequest.RequestedToInstanceId;
                     _pendingTakeoverTargetDisplayName = existingLocalState.Document.PendingTakeoverRequest.RequestedToDisplayName;
                 }
-                else
-                {
-                    _pendingTakeoverRequestId = null;
-                    _pendingTakeoverTargetInstanceId = null;
-                    _pendingTakeoverTargetDisplayName = null;
-                }
             }
             else
             {
@@ -1894,6 +1889,7 @@ internal sealed class MainForm : Form
             }
 
             states = listResult.States.ToList();
+            SyncPendingTakeoverFieldsFromLocalState(states);
             var owner = DeterminePollingLockOwner(states);
             _lockOwnerInstanceId = owner?.Document.InstanceId;
             _lockOwnerDisplayName = owner?.Document.DisplayName;
@@ -1944,10 +1940,28 @@ internal sealed class MainForm : Form
         }
         finally
         {
-            _nextPollingStateSyncAtUtc = DateTimeOffset.UtcNow.AddMilliseconds(_pollingLockSyncTimer.Interval);
             _distributedPollingSyncInProgress = false;
             UpdateSettingsLockStatus();
         }
+    }
+
+    private void SyncPendingTakeoverFieldsFromLocalState(IReadOnlyCollection<GoogleDrivePollingStateFile> states)
+    {
+        var localState = states.FirstOrDefault(file =>
+            string.Equals(file.Document.InstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase));
+
+        if (localState?.Document.PendingTakeoverRequest?.IsActive == true &&
+            string.Equals(localState.Document.PendingTakeoverRequest.RequestedByInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase))
+        {
+            _pendingTakeoverRequestId = localState.Document.PendingTakeoverRequest.RequestId;
+            _pendingTakeoverTargetInstanceId = localState.Document.PendingTakeoverRequest.RequestedToInstanceId;
+            _pendingTakeoverTargetDisplayName = localState.Document.PendingTakeoverRequest.RequestedToDisplayName;
+            return;
+        }
+
+        _pendingTakeoverRequestId = null;
+        _pendingTakeoverTargetInstanceId = null;
+        _pendingTakeoverTargetDisplayName = null;
     }
 
     private async Task<bool> TryHandleIncomingTakeoverRequestAsync(IReadOnlyCollection<GoogleDrivePollingStateFile> states)
