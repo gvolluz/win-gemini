@@ -9,6 +9,7 @@ internal sealed class MainForm : Form
     private const int WindowStateSaveDebounceMs = 350;
     private const int TopBarPollMs = 120;
     private const int GoogleDriveSyncDebounceMs = 1200;
+    private const int EvernoteAutoExportCooldownSeconds = 30;
 
     private readonly Panel _webViewHost;
     private readonly Panel _evernoteExportPanel;
@@ -37,6 +38,7 @@ internal sealed class MainForm : Form
     private TreeNode? _evernoteContextNode;
     private bool _syncingEvernoteTreeChecks;
     private bool _evernotePollingInProgress;
+    private DateTime _lastEvernoteAutoExportUtc = DateTime.MinValue;
     private bool _googleDriveSyncInProgress;
     private bool _suspendGoogleDriveSyncQueue;
     private bool _syncingEvernoteShowIgnoredToggle;
@@ -1723,6 +1725,7 @@ internal sealed class MainForm : Form
         _appState.EvernoteSnapshotInitialized = false;
         _appState.EvernoteStackNoteSnapshots = [];
         _appState.EvernoteNotebookNoteSnapshots = [];
+        _lastEvernoteAutoExportUtc = DateTime.MinValue;
     }
 
     private void PollEvernoteTracking(bool allowAutoExport, bool showErrors, bool ignorePause)
@@ -1791,7 +1794,7 @@ internal sealed class MainForm : Form
                 .ToArray();
             var currentNotebookMap = BuildNotebookSnapshotMap(trackingSnapshot.NotebookSnapshots);
             var changeSummary = AnalyzeChangedNotes(monitoredNotebookIds, previousNotebookMap, currentNotebookMap);
-            if (changeSummary.NoteChangeCount == 1)
+            if (changeSummary.NoteChangeCount >= 1)
             {
                 var targetExportFileNames = monitoredNotebooks
                     .Where(notebook => changeSummary.ChangedNotebookIds.Contains(notebook.NotebookId))
@@ -1803,8 +1806,23 @@ internal sealed class MainForm : Form
                     return;
                 }
 
+                var cooldown = TimeSpan.FromSeconds(EvernoteAutoExportCooldownSeconds);
+                var nowUtc = DateTime.UtcNow;
+                if (_lastEvernoteAutoExportUtc != DateTime.MinValue)
+                {
+                    var elapsed = nowUtc - _lastEvernoteAutoExportUtc;
+                    if (elapsed < cooldown)
+                    {
+                        var remainingSeconds = Math.Max(1, (int)Math.Ceiling((cooldown - elapsed).TotalSeconds));
+                        SetEvernoteStatus(
+                            $"{changeSummary.NoteChangeCount} note change(s) detected in {dbPath}. Auto export cooldown active ({remainingSeconds}s remaining).");
+                        return;
+                    }
+                }
+
+                _lastEvernoteAutoExportUtc = nowUtc;
                 SetEvernoteStatus(
-                    $"1 note change detected in {dbPath}. Auto export running for {string.Join(", ", targetExportFileNames)}...");
+                    $"{changeSummary.NoteChangeCount} note change(s) detected in {dbPath}. Auto export running for {string.Join(", ", targetExportFileNames)}...");
                 _ = ExportSelectedEvernoteContentToMarkdownAsync(
                     showDialogs: false,
                     source: "auto",
