@@ -23,6 +23,7 @@ internal static class AppConfig
     internal const string GoogleDriveVisibleRootFolderName = "Apps";
     internal const string GoogleDriveVisibleAppFolderName = "WinGemini";
     internal const string GoogleDriveConfigFileName = "WinGeminiWrapper.config.json";
+    internal const string GoogleDrivePollingStateFilePrefix = "state_";
     internal const string EvernoteExportRootFolderName = "ExportEvernote";
     internal const string EvernoteExportBackupsFolderName = "backups";
 

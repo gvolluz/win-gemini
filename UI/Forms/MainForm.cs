@@ -1,5 +1,6 @@
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
+using System.Security.Cryptography;
 
 namespace WinGeminiWrapper;
 
@@ -9,8 +10,10 @@ internal sealed class MainForm : Form
     private const int WindowStateSaveDebounceMs = 350;
     private const int TopBarPollMs = 120;
     private const int GoogleDriveSyncDebounceMs = 1200;
+    private const int PollingLockSyncIntervalMs = 6000;
     private const int EvernoteAutoExportCooldownSeconds = 30;
     private const int TraySyncAnimationIntervalMs = 90;
+    private static readonly TimeSpan PollingLockOwnerStaleThreshold = TimeSpan.FromMinutes(2);
 
     private readonly Panel _webViewHost;
     private readonly Panel _evernoteExportPanel;
@@ -30,6 +33,8 @@ internal sealed class MainForm : Form
     private readonly System.Windows.Forms.Timer _topBarVisibilityTimer;
     private readonly System.Windows.Forms.Timer _evernotePollingTimer;
     private readonly System.Windows.Forms.Timer _googleDriveSyncTimer;
+    private readonly System.Windows.Forms.Timer _pollingLockSyncTimer;
+    private readonly System.Windows.Forms.Timer _settingsUiRefreshTimer;
     private readonly System.Windows.Forms.Timer _traySyncAnimationTimer;
     private CoreWebView2Environment? _webViewEnvironment;
     private AppState _appState;
@@ -50,12 +55,40 @@ internal sealed class MainForm : Form
     private bool _balloonShown;
     private bool _logoutInProgress;
     private WrappedApp _currentApp;
+    private readonly string _localMachineHostName;
+    private readonly string _localMachineInstanceSuffix;
+    private readonly string _localMachineInstanceId;
+    private readonly string _localMachineDefaultStateFileName;
+    private readonly string _localMachineSuffixedStateFileName;
+    private string _localMachineStateFileName;
+    private string? _localMachineStateFileId;
+    private string? _lockOwnerInstanceId;
+    private string? _lockOwnerDisplayName;
+    private bool _distributedPollingSyncInProgress;
+    private string? _pendingTakeoverRequestId;
+    private string? _pendingTakeoverTargetInstanceId;
+    private string? _pendingTakeoverTargetDisplayName;
+    private SettingsForm? _settingsFormOpenInstance;
+    private bool _settingsPauseChangeInProgress;
+    private bool _settingsForceLockInProgress;
+    private DateTimeOffset _nextPollingStateSyncAtUtc;
+    private int _pendingTakeoverMissingObservationCount;
+    private readonly Dictionary<string, DateTimeOffset?> _pollingStateMetaSnapshot = new(StringComparer.OrdinalIgnoreCase);
+    private List<GoogleDrivePollingStateFile> _cachedPollingStates = [];
 
     internal MainForm()
     {
         AppLogger.Info("MainForm constructor started.");
+        _localMachineHostName = NormalizeHostName(Environment.MachineName);
+        _localMachineInstanceSuffix = BuildStableInstanceSuffix();
+        _localMachineInstanceId = $"{_localMachineHostName}:{_localMachineInstanceSuffix}";
+        _localMachineDefaultStateFileName = BuildStateFileName(_localMachineHostName, null);
+        _localMachineSuffixedStateFileName = BuildStateFileName(_localMachineHostName, _localMachineInstanceSuffix);
+        _localMachineStateFileName = _localMachineDefaultStateFileName;
         _appState = AppStateStore.Load();
         _appState.Normalize();
+        // Do not trust local PauseAutomaticPolling at startup; Drive state is source of truth.
+        _appState.EvernotePollingPaused = true;
         _currentApp = Enum.IsDefined(typeof(WrappedApp), _appState.LastSelectedApp)
             ? _appState.LastSelectedApp
             : AppConfig.DefaultApp;
@@ -118,6 +151,19 @@ internal sealed class MainForm : Form
         };
         _googleDriveSyncTimer.Tick += GoogleDriveSyncTimer_Tick;
 
+        _pollingLockSyncTimer = new System.Windows.Forms.Timer
+        {
+            Interval = PollingLockSyncIntervalMs
+        };
+        _pollingLockSyncTimer.Tick += PollingLockSyncTimer_Tick;
+        _nextPollingStateSyncAtUtc = DateTimeOffset.UtcNow.AddMilliseconds(_pollingLockSyncTimer.Interval);
+
+        _settingsUiRefreshTimer = new System.Windows.Forms.Timer
+        {
+            Interval = 1000
+        };
+        _settingsUiRefreshTimer.Tick += (_, _) => UpdateSettingsLockStatus();
+
         _traySyncAnimationTimer = new System.Windows.Forms.Timer
         {
             Interval = TraySyncAnimationIntervalMs
@@ -147,6 +193,7 @@ internal sealed class MainForm : Form
             Directory.CreateDirectory(AppConfig.WebViewUserDataFolder);
             Directory.CreateDirectory(AppConfig.AppDataRootFolder);
             await TryAutoRestoreConfigFromGoogleDriveAsync();
+            await SyncDistributedPollingStateAsync(showErrors: false, processIncomingRequests: false);
 
             _currentApp = Enum.IsDefined(typeof(WrappedApp), _appState.LastSelectedApp)
                 ? _appState.LastSelectedApp
@@ -189,9 +236,13 @@ internal sealed class MainForm : Form
         CaptureWindowPlacement();
         QueueAppStateSave();
         _topBarVisibilityTimer.Start();
+        _pollingLockSyncTimer.Start();
+        _nextPollingStateSyncAtUtc = DateTimeOffset.UtcNow.AddMilliseconds(_pollingLockSyncTimer.Interval);
+        _settingsUiRefreshTimer.Start();
         ApplyEvernotePollingSettings();
         LoadEvernoteTreeFromConfiguredRoot(showErrors: false);
         UpdateTopBarVisibility();
+        _ = SyncDistributedPollingStateAsync(showErrors: false, processIncomingRequests: true);
     }
 
     private async Task TryAutoRestoreConfigFromGoogleDriveAsync()
@@ -1728,6 +1779,14 @@ internal sealed class MainForm : Form
         PollEvernoteTracking(allowAutoExport: true, showErrors: false, ignorePause: false);
     }
 
+    private async void PollingLockSyncTimer_Tick(object? sender, EventArgs e)
+    {
+        _nextPollingStateSyncAtUtc = DateTimeOffset.UtcNow.AddMilliseconds(_pollingLockSyncTimer.Interval);
+        UpdateSettingsLockStatus();
+        LogPollingLock($"Timer tick: launching distributed sync (next in {_pollingLockSyncTimer.Interval / 1000}s).");
+        await SyncDistributedPollingStateAsync(showErrors: false, processIncomingRequests: true);
+    }
+
     private void ApplyEvernotePollingSettings()
     {
         var intervalMinutes = Math.Max(1, _appState.EvernotePollingIntervalMinutes);
@@ -1744,6 +1803,820 @@ internal sealed class MainForm : Form
         {
             _evernotePollingTimer.Start();
         }
+    }
+
+    private async Task SyncDistributedPollingStateAsync(bool showErrors, bool processIncomingRequests)
+    {
+        if (_distributedPollingSyncInProgress)
+        {
+            LogPollingLock("Sync skipped: another sync is already in progress.");
+            UpdateSettingsLockStatus();
+            return;
+        }
+
+        if (!GoogleDriveConfigSyncService.IsConfigured(_appState))
+        {
+            _lockOwnerInstanceId = _localMachineInstanceId;
+            _lockOwnerDisplayName = GetLocalDisplayName();
+            LogPollingLock("Sync skipped: Google Drive sync not configured, local instance treated as lock owner.");
+            UpdateSettingsLockStatus();
+            return;
+        }
+
+        _distributedPollingSyncInProgress = true;
+        try
+        {
+            LogPollingLock($"Sync start (processIncomingRequests={processIncomingRequests}, paused={_appState.EvernotePollingPaused}, pending={DescribePendingLocalRequest()}).");
+            var metaListResult = await GoogleDriveConfigSyncService.ListPollingStateMetasAsync(_appState, CancellationToken.None);
+            if (!metaListResult.IsSuccess)
+            {
+                LogPollingLock($"State meta list #1 failed: {metaListResult.Error ?? "unknown error"}");
+                if (showErrors && !string.IsNullOrWhiteSpace(metaListResult.Error))
+                {
+                    MessageBox.Show(
+                        this,
+                        $"Impossible de lire les state files de synchronisation.{Environment.NewLine}{Environment.NewLine}{metaListResult.Error}",
+                        "Distributed Polling Lock",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                }
+
+                return;
+            }
+
+            var states = await ResolvePollingStatesFromMetasAsync(metaListResult.States, reason: "phase1");
+            if (states is null)
+            {
+                return;
+            }
+            var existingLocalState = states.FirstOrDefault(file =>
+                string.Equals(file.Document.InstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase));
+
+            if (existingLocalState is not null)
+            {
+                _localMachineStateFileId = existingLocalState.FileId;
+                _localMachineStateFileName = existingLocalState.FileName;
+                if (existingLocalState.Document.PendingTakeoverRequest?.IsActive == true &&
+                    string.Equals(existingLocalState.Document.PendingTakeoverRequest.RequestedByInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase))
+                {
+                    _pendingTakeoverRequestId = existingLocalState.Document.PendingTakeoverRequest.RequestId;
+                    _pendingTakeoverTargetInstanceId = existingLocalState.Document.PendingTakeoverRequest.RequestedToInstanceId;
+                    _pendingTakeoverTargetDisplayName = existingLocalState.Document.PendingTakeoverRequest.RequestedToDisplayName;
+                }
+
+                // If remote already reflects an approved takeover, avoid re-writing an old pending request locally.
+                if (!string.IsNullOrWhiteSpace(_pendingTakeoverRequestId) &&
+                    existingLocalState.Document.PendingTakeoverRequest is null &&
+                    !existingLocalState.Document.PauseAutomaticPolling)
+                {
+                    _appState.EvernotePollingPaused = false;
+                    _pendingTakeoverRequestId = null;
+                    _pendingTakeoverTargetInstanceId = null;
+                    _pendingTakeoverTargetDisplayName = null;
+                    _pendingTakeoverMissingObservationCount = 0;
+                    LogPollingLock("Remote state indicates takeover already approved; adopting active local state before upsert.");
+                }
+            }
+            else
+            {
+                _localMachineStateFileName = ResolveLocalStateFileName(states);
+            }
+
+            var localDocument = BuildLocalPollingStateDocument();
+            LogPollingLock($"Upserting local state '{_localMachineStateFileName}' (fileId={_localMachineStateFileId ?? "new"}): paused={localDocument.PauseAutomaticPolling}, pending={DescribePending(localDocument.PendingTakeoverRequest)}.");
+            var upsertResult = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+                _appState,
+                _localMachineStateFileName,
+                localDocument,
+                _localMachineStateFileId,
+                CancellationToken.None);
+
+            if (!upsertResult.IsSuccess)
+            {
+                LogPollingLock($"Local state upsert failed: {upsertResult.Error ?? "unknown error"}");
+                if (showErrors && !string.IsNullOrWhiteSpace(upsertResult.Error))
+                {
+                    MessageBox.Show(
+                        this,
+                        $"Impossible de mettre a jour le state local de synchronisation.{Environment.NewLine}{Environment.NewLine}{upsertResult.Error}",
+                        "Distributed Polling Lock",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                }
+
+                return;
+            }
+
+            if (!string.IsNullOrWhiteSpace(upsertResult.FileId))
+            {
+                _localMachineStateFileId = upsertResult.FileId;
+            }
+            LogPollingLock($"Local state upsert ok (fileId={_localMachineStateFileId ?? "n/a"}).");
+            UpdateCachedLocalPollingState(localDocument);
+
+            metaListResult = await GoogleDriveConfigSyncService.ListPollingStateMetasAsync(_appState, CancellationToken.None);
+            if (!metaListResult.IsSuccess)
+            {
+                LogPollingLock($"State meta list #2 failed: {metaListResult.Error ?? "unknown error"}");
+                return;
+            }
+
+            states = await ResolvePollingStatesFromMetasAsync(metaListResult.States, reason: "phase2");
+            if (states is null)
+            {
+                return;
+            }
+            var owner = DeterminePollingLockOwner(states);
+            _lockOwnerInstanceId = owner?.Document.InstanceId;
+            _lockOwnerDisplayName = owner?.Document.DisplayName;
+            SyncPendingTakeoverFieldsFromLocalState(states, owner);
+            LogPollingLock($"Owner resolved: {(_lockOwnerDisplayName ?? "(none)")}, pending(local)={DescribePendingLocalRequest()}.");
+
+            if (!string.Equals(_lockOwnerInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase) &&
+                !_appState.EvernotePollingPaused)
+            {
+                LogPollingLock("Detected local active polling without lock ownership; forcing local pause.");
+                _appState.EvernotePollingPaused = true;
+                ApplyEvernotePollingSettings();
+                SaveAppStateNow(queueGoogleDriveSync: false);
+                localDocument = BuildLocalPollingStateDocument();
+                var forcedPauseResult = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+                    _appState,
+                    _localMachineStateFileName,
+                    localDocument,
+                    _localMachineStateFileId,
+                    CancellationToken.None);
+                if (forcedPauseResult.IsSuccess && !string.IsNullOrWhiteSpace(forcedPauseResult.FileId))
+                {
+                    _localMachineStateFileId = forcedPauseResult.FileId;
+                }
+                LogPollingLock($"Forced pause persisted (success={forcedPauseResult.IsSuccess}, fileId={forcedPauseResult.FileId ?? "n/a"}).");
+            }
+
+            if (processIncomingRequests &&
+                owner is not null &&
+                string.Equals(owner.Document.InstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase) &&
+                !_appState.EvernotePollingPaused)
+            {
+                var didHandle = await TryHandleIncomingTakeoverRequestAsync(states);
+                if (didHandle)
+                {
+                    LogPollingLock("Incoming takeover request handled by current lock owner.");
+                    return;
+                }
+            }
+
+            LogPollingLock("Sync completed without incoming takeover action.");
+        }
+        catch (Exception exception)
+        {
+            LogPollingLock($"Sync exception: {exception.Message}");
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Distributed polling lock sync failed: {exception.Message}");
+            if (showErrors)
+            {
+                MessageBox.Show(
+                    this,
+                    $"Erreur pendant la synchronisation distribuee du verrou de polling.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
+                    "Distributed Polling Lock",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+        }
+        finally
+        {
+            _distributedPollingSyncInProgress = false;
+            UpdateSettingsLockStatus();
+        }
+    }
+
+    private void SyncPendingTakeoverFieldsFromLocalState(
+        IReadOnlyCollection<GoogleDrivePollingStateFile> states,
+        GoogleDrivePollingStateFile? owner)
+    {
+        var localState = states.FirstOrDefault(file =>
+            string.Equals(file.Document.InstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase));
+
+        if (localState?.Document.PendingTakeoverRequest?.IsActive == true &&
+            string.Equals(localState.Document.PendingTakeoverRequest.RequestedByInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase))
+        {
+            _pendingTakeoverRequestId = localState.Document.PendingTakeoverRequest.RequestId;
+            _pendingTakeoverTargetInstanceId = localState.Document.PendingTakeoverRequest.RequestedToInstanceId;
+            _pendingTakeoverTargetDisplayName = localState.Document.PendingTakeoverRequest.RequestedToDisplayName;
+            _pendingTakeoverMissingObservationCount = 0;
+            LogPollingLock($"Local pending request confirmed in Drive: {DescribePending(localState.Document.PendingTakeoverRequest)}.");
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(_pendingTakeoverRequestId))
+        {
+            _pendingTakeoverMissingObservationCount = 0;
+            _pendingTakeoverTargetInstanceId = null;
+            _pendingTakeoverTargetDisplayName = null;
+            return;
+        }
+
+        if (localState is not null && !localState.Document.PauseAutomaticPolling)
+        {
+            // Request accepted: requester is now active.
+            _pendingTakeoverMissingObservationCount = 0;
+            _pendingTakeoverRequestId = null;
+            _pendingTakeoverTargetInstanceId = null;
+            _pendingTakeoverTargetDisplayName = null;
+            LogPollingLock("Local pending request cleared: requester became active.");
+            return;
+        }
+
+        var localOwnsLock = string.Equals(owner?.Document.InstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase);
+        if (localOwnsLock)
+        {
+            _pendingTakeoverMissingObservationCount = 0;
+            _pendingTakeoverRequestId = null;
+            _pendingTakeoverTargetInstanceId = null;
+            _pendingTakeoverTargetDisplayName = null;
+            LogPollingLock("Local pending request cleared: local instance owns lock.");
+            return;
+        }
+
+        // Google Drive list/read can be briefly stale; avoid dropping pending state too quickly.
+        _pendingTakeoverMissingObservationCount++;
+        if (_pendingTakeoverMissingObservationCount < 3)
+        {
+            LogPollingLock($"Pending request missing in Drive read; keeping local pending state (miss #{_pendingTakeoverMissingObservationCount}).");
+            return;
+        }
+
+        _pendingTakeoverMissingObservationCount = 0;
+        _pendingTakeoverRequestId = null;
+        _pendingTakeoverTargetInstanceId = null;
+        _pendingTakeoverTargetDisplayName = null;
+        LogPollingLock("Local pending request cleared after repeated missing observations.");
+    }
+
+    private async Task<List<GoogleDrivePollingStateFile>?> ResolvePollingStatesFromMetasAsync(
+        IReadOnlyList<GoogleDrivePollingStateMetaFile> metas,
+        string reason)
+    {
+        var metadataChanged = HasPollingStateMetadataChanged(metas);
+        if (!metadataChanged && _cachedPollingStates.Count > 0)
+        {
+            LogPollingLock($"State load {reason}: metadata unchanged, using cached states ({_cachedPollingStates.Count} file(s)).");
+            return _cachedPollingStates
+                .Select(state => new GoogleDrivePollingStateFile
+                {
+                    FileId = state.FileId,
+                    FileName = state.FileName,
+                    ModifiedTimeUtc = state.ModifiedTimeUtc,
+                    Document = ClonePollingStateDocument(state.Document)
+                })
+                .ToList();
+        }
+
+        var fullListResult = await GoogleDriveConfigSyncService.ListPollingStatesAsync(_appState, CancellationToken.None);
+        if (!fullListResult.IsSuccess)
+        {
+            LogPollingLock($"State full list {reason} failed: {fullListResult.Error ?? "unknown error"}");
+            return null;
+        }
+
+        var loadedStates = fullListResult.States.ToList();
+        _cachedPollingStates = loadedStates
+            .Select(state => new GoogleDrivePollingStateFile
+            {
+                FileId = state.FileId,
+                FileName = state.FileName,
+                ModifiedTimeUtc = state.ModifiedTimeUtc,
+                Document = ClonePollingStateDocument(state.Document)
+            })
+            .ToList();
+        ApplyPollingStateMetadataSnapshot(metas);
+        LogPollingLock($"State load {reason}: metadata changed, full state reload ({loadedStates.Count} file(s)).");
+        return loadedStates;
+    }
+
+    private bool HasPollingStateMetadataChanged(IReadOnlyList<GoogleDrivePollingStateMetaFile> metas)
+    {
+        if (_pollingStateMetaSnapshot.Count != metas.Count)
+        {
+            return true;
+        }
+
+        foreach (var meta in metas)
+        {
+            if (!_pollingStateMetaSnapshot.TryGetValue(meta.FileId, out var previousModified))
+            {
+                return true;
+            }
+
+            if (previousModified != meta.ModifiedTimeUtc)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void ApplyPollingStateMetadataSnapshot(IReadOnlyList<GoogleDrivePollingStateMetaFile> metas)
+    {
+        _pollingStateMetaSnapshot.Clear();
+        foreach (var meta in metas)
+        {
+            _pollingStateMetaSnapshot[meta.FileId] = meta.ModifiedTimeUtc;
+        }
+    }
+
+    private void UpdateCachedLocalPollingState(GoogleDrivePollingStateDocument localDocument)
+    {
+        var cacheIndex = _cachedPollingStates.FindIndex(state =>
+            string.Equals(state.Document.InstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase));
+        var localStateCopy = new GoogleDrivePollingStateFile
+        {
+            FileId = _localMachineStateFileId ?? string.Empty,
+            FileName = _localMachineStateFileName,
+            ModifiedTimeUtc = DateTimeOffset.UtcNow,
+            Document = ClonePollingStateDocument(localDocument)
+        };
+
+        if (cacheIndex >= 0)
+        {
+            _cachedPollingStates[cacheIndex] = localStateCopy;
+        }
+        else
+        {
+            _cachedPollingStates.Add(localStateCopy);
+        }
+    }
+
+    private async Task<bool> TryHandleIncomingTakeoverRequestAsync(IReadOnlyCollection<GoogleDrivePollingStateFile> states)
+    {
+        var incomingRequest = states
+            .Where(state => state.Document.PendingTakeoverRequest?.IsActive == true)
+            .Select(state => new { Requester = state, Request = state.Document.PendingTakeoverRequest! })
+            .OrderBy(entry => entry.Request.RequestedAtUtc)
+            .FirstOrDefault(entry =>
+                string.Equals(entry.Request.RequestedToInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase));
+
+        if (incomingRequest is null)
+        {
+            LogPollingLock("No incoming takeover request for local owner.");
+            return false;
+        }
+
+        var requesterName = string.IsNullOrWhiteSpace(incomingRequest.Request.RequestedByDisplayName)
+            ? incomingRequest.Requester.Document.DisplayName
+            : incomingRequest.Request.RequestedByDisplayName;
+        LogPollingLock($"Incoming takeover request detected: requestId={incomingRequest.Request.RequestId}, from={requesterName}, to={incomingRequest.Request.RequestedToDisplayName}.");
+
+        var decision = MessageBox.Show(
+            this,
+            $"{requesterName} demande la main pour activer la synchronisation automatique.{Environment.NewLine}{Environment.NewLine}Confirmer le transfert ?",
+            "Demande de transfert de verrou",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question);
+        LogPollingLock($"Incoming takeover request decision: {(decision == DialogResult.Yes ? "approved" : "rejected")}.");
+
+        var updatedRequesterDocument = ClonePollingStateDocument(incomingRequest.Requester.Document);
+        updatedRequesterDocument.PendingTakeoverRequest = null;
+
+        if (decision == DialogResult.Yes)
+        {
+            _appState.EvernotePollingPaused = true;
+            ApplyEvernotePollingSettings();
+            SaveAppStateNow(queueGoogleDriveSync: false);
+
+            var nowUtc = DateTimeOffset.UtcNow;
+            updatedRequesterDocument.PauseAutomaticPolling = false;
+            updatedRequesterDocument.UpdatedAtUtc = nowUtc;
+            var requesterApproved = await UpsertAndVerifyRequesterStateAsync(
+                incomingRequest.Requester,
+                updatedRequesterDocument,
+                expectedPauseAutomaticPolling: false,
+                operationLabel: "approval");
+            if (!requesterApproved)
+            {
+                LogPollingLock("Requester update after approval could not be verified on Drive.");
+                return true;
+            }
+
+            var updatedLocalDocument = BuildLocalPollingStateDocument();
+            updatedLocalDocument.PendingTakeoverRequest = null;
+            updatedLocalDocument.PauseAutomaticPolling = true;
+            updatedLocalDocument.UpdatedAtUtc = nowUtc;
+            var localUpsert = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+                _appState,
+                _localMachineStateFileName,
+                updatedLocalDocument,
+                _localMachineStateFileId,
+                CancellationToken.None);
+            LogPollingLock(
+                $"Owner state updated after approval: {_localMachineStateFileName} " +
+                $"(success={localUpsert.IsSuccess}, fileId={localUpsert.FileId ?? "n/a"}).");
+
+            return true;
+        }
+
+        updatedRequesterDocument.PauseAutomaticPolling = true;
+        updatedRequesterDocument.UpdatedAtUtc = DateTimeOffset.UtcNow;
+        await UpsertAndVerifyRequesterStateAsync(
+            incomingRequest.Requester,
+            updatedRequesterDocument,
+            expectedPauseAutomaticPolling: true,
+            operationLabel: "rejection");
+
+        return true;
+    }
+
+    private async Task<bool> UpsertAndVerifyRequesterStateAsync(
+        GoogleDrivePollingStateFile requesterState,
+        GoogleDrivePollingStateDocument updatedRequesterDocument,
+        bool expectedPauseAutomaticPolling,
+        string operationLabel)
+    {
+        var preferredFileId = requesterState.FileId;
+        for (var attempt = 1; attempt <= 3; attempt++)
+        {
+            var upsert = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+                _appState,
+                requesterState.FileName,
+                updatedRequesterDocument,
+                preferredFileId,
+                CancellationToken.None);
+            if (upsert.IsSuccess && !string.IsNullOrWhiteSpace(upsert.FileId))
+            {
+                preferredFileId = upsert.FileId;
+            }
+
+            LogPollingLock(
+                $"Requester upsert ({operationLabel}) attempt {attempt}/3: " +
+                $"success={upsert.IsSuccess}, fileId={upsert.FileId ?? preferredFileId ?? "n/a"}, error={upsert.Error ?? "none"}.");
+            if (!upsert.IsSuccess)
+            {
+                await Task.Delay(250);
+                continue;
+            }
+
+            var verificationList = await GoogleDriveConfigSyncService.ListPollingStatesAsync(_appState, CancellationToken.None);
+            if (!verificationList.IsSuccess)
+            {
+                LogPollingLock($"Requester verify list failed on attempt {attempt}/3: {verificationList.Error ?? "unknown error"}.");
+                await Task.Delay(250);
+                continue;
+            }
+
+            var fileIdForLookup = preferredFileId ?? requesterState.FileId;
+            var reloadedRequester = verificationList.States.FirstOrDefault(state =>
+                string.Equals(state.FileId, fileIdForLookup, StringComparison.OrdinalIgnoreCase));
+            if (reloadedRequester is null)
+            {
+                LogPollingLock($"Requester verify attempt {attempt}/3: file not found by id={fileIdForLookup ?? "n/a"}.");
+                await Task.Delay(250);
+                continue;
+            }
+
+            var pendingIsCleared = reloadedRequester.Document.PendingTakeoverRequest is null;
+            var pauseMatches = reloadedRequester.Document.PauseAutomaticPolling == expectedPauseAutomaticPolling;
+            LogPollingLock(
+                $"Requester verify attempt {attempt}/3: pendingCleared={pendingIsCleared}, " +
+                $"pause={reloadedRequester.Document.PauseAutomaticPolling}, expectedPause={expectedPauseAutomaticPolling}.");
+            if (pendingIsCleared && pauseMatches)
+            {
+                return true;
+            }
+
+            await Task.Delay(250);
+        }
+
+        return false;
+    }
+
+    private GoogleDrivePollingStateFile? DeterminePollingLockOwner(IEnumerable<GoogleDrivePollingStateFile> states)
+    {
+        var now = DateTimeOffset.UtcNow;
+        return states
+            .Where(state => !state.Document.PauseAutomaticPolling)
+            .Where(state =>
+            {
+                var age = now - state.Document.UpdatedAtUtc;
+                return age <= PollingLockOwnerStaleThreshold;
+            })
+            .OrderByDescending(state => state.Document.UpdatedAtUtc)
+            .ThenBy(state => state.Document.InstanceId, StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault();
+    }
+
+    private string ResolveLocalStateFileName(IReadOnlyCollection<GoogleDrivePollingStateFile> states)
+    {
+        var hasAnotherHostState = states.Any(state =>
+            string.Equals(state.Document.HostName, _localMachineHostName, StringComparison.OrdinalIgnoreCase));
+
+        return hasAnotherHostState
+            ? _localMachineSuffixedStateFileName
+            : _localMachineDefaultStateFileName;
+    }
+
+    private GoogleDrivePollingStateDocument BuildLocalPollingStateDocument()
+    {
+        var pendingRequest = BuildPendingTakeoverRequest();
+        return new GoogleDrivePollingStateDocument
+        {
+            InstanceId = _localMachineInstanceId,
+            HostName = _localMachineHostName,
+            DisplayName = GetLocalDisplayName(),
+            PauseAutomaticPolling = _appState.EvernotePollingPaused,
+            UpdatedAtUtc = DateTimeOffset.UtcNow,
+            PendingTakeoverRequest = pendingRequest
+        };
+    }
+
+    private GoogleDrivePollingTakeoverRequest? BuildPendingTakeoverRequest()
+    {
+        if (string.IsNullOrWhiteSpace(_pendingTakeoverRequestId) ||
+            string.IsNullOrWhiteSpace(_pendingTakeoverTargetInstanceId) ||
+            string.IsNullOrWhiteSpace(_pendingTakeoverTargetDisplayName))
+        {
+            return null;
+        }
+
+        return new GoogleDrivePollingTakeoverRequest
+        {
+            RequestId = _pendingTakeoverRequestId,
+            RequestedByInstanceId = _localMachineInstanceId,
+            RequestedByDisplayName = GetLocalDisplayName(),
+            RequestedToInstanceId = _pendingTakeoverTargetInstanceId,
+            RequestedToDisplayName = _pendingTakeoverTargetDisplayName,
+            RequestedAtUtc = DateTimeOffset.UtcNow,
+            IsActive = true
+        };
+    }
+
+    private static GoogleDrivePollingStateDocument ClonePollingStateDocument(GoogleDrivePollingStateDocument source)
+    {
+        return new GoogleDrivePollingStateDocument
+        {
+            InstanceId = source.InstanceId,
+            HostName = source.HostName,
+            DisplayName = source.DisplayName,
+            PauseAutomaticPolling = source.PauseAutomaticPolling,
+            UpdatedAtUtc = source.UpdatedAtUtc,
+            PendingTakeoverRequest = source.PendingTakeoverRequest is null
+                ? null
+                : new GoogleDrivePollingTakeoverRequest
+                {
+                    RequestId = source.PendingTakeoverRequest.RequestId,
+                    RequestedByInstanceId = source.PendingTakeoverRequest.RequestedByInstanceId,
+                    RequestedByDisplayName = source.PendingTakeoverRequest.RequestedByDisplayName,
+                    RequestedToInstanceId = source.PendingTakeoverRequest.RequestedToInstanceId,
+                    RequestedToDisplayName = source.PendingTakeoverRequest.RequestedToDisplayName,
+                    RequestedAtUtc = source.PendingTakeoverRequest.RequestedAtUtc,
+                    IsActive = source.PendingTakeoverRequest.IsActive
+                }
+        };
+    }
+
+    private static string NormalizeHostName(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "unknown-host";
+        }
+
+        var normalized = value.Trim();
+        var invalidChars = Path.GetInvalidFileNameChars();
+        foreach (var invalidChar in invalidChars)
+        {
+            normalized = normalized.Replace(invalidChar, '_');
+        }
+
+        return normalized;
+    }
+
+    private static string BuildStateFileName(string hostName, string? suffix)
+    {
+        var sanitizedHost = NormalizeHostName(hostName);
+        var sanitizedSuffix = string.IsNullOrWhiteSpace(suffix)
+            ? null
+            : suffix.Trim();
+
+        return string.IsNullOrWhiteSpace(sanitizedSuffix)
+            ? $"{AppConfig.GoogleDrivePollingStateFilePrefix}{sanitizedHost}.json"
+            : $"{AppConfig.GoogleDrivePollingStateFilePrefix}{sanitizedHost}_{sanitizedSuffix}.json";
+    }
+
+    private static string BuildStableInstanceSuffix()
+    {
+        var source = Path.GetFullPath(AppContext.BaseDirectory).ToUpperInvariant();
+        var hashBytes = SHA1.HashData(System.Text.Encoding.UTF8.GetBytes(source));
+        return Convert.ToHexString(hashBytes).Substring(0, 6).ToLowerInvariant();
+    }
+
+    private string GetLocalDisplayName()
+    {
+        return string.Equals(_localMachineStateFileName, _localMachineDefaultStateFileName, StringComparison.OrdinalIgnoreCase)
+            ? _localMachineHostName
+            : $"{_localMachineHostName}_{_localMachineInstanceSuffix}";
+    }
+
+    private void UpdateSettingsLockStatus()
+    {
+        if (_settingsFormOpenInstance is null || _settingsFormOpenInstance.IsDisposed)
+        {
+            _settingsFormOpenInstance = null;
+            return;
+        }
+
+        var owner = string.IsNullOrWhiteSpace(_lockOwnerDisplayName) ? "(none)" : _lockOwnerDisplayName;
+        var isLocalOwner = string.Equals(_lockOwnerInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase);
+        _settingsFormOpenInstance.UpdatePollingLockStatus(owner, isLocalOwner);
+        _settingsFormOpenInstance.UpdatePendingPollingRequest(_pendingTakeoverTargetDisplayName);
+        _settingsFormOpenInstance.ConfirmPausePollingState(_appState.EvernotePollingPaused);
+        _settingsFormOpenInstance.SetPausePollingBusy(_settingsPauseChangeInProgress || _distributedPollingSyncInProgress || _settingsForceLockInProgress);
+        _settingsFormOpenInstance.SetForceLockBusy(_settingsForceLockInProgress || _distributedPollingSyncInProgress);
+        var intervalSeconds = Math.Max(1, _pollingLockSyncTimer.Interval / 1000);
+        var secondsUntilNextPoll = (int)Math.Ceiling((_nextPollingStateSyncAtUtc - DateTimeOffset.UtcNow).TotalSeconds);
+        _settingsFormOpenInstance.UpdateNextStatePollInfo(intervalSeconds, secondsUntilNextPoll);
+    }
+
+    private async Task HandlePausePollingToggleFromSettingsAsync(bool isPaused)
+    {
+        if (_settingsPauseChangeInProgress)
+        {
+            LogPollingLock("Pause toggle ignored: previous pause change still in progress.");
+            return;
+        }
+
+        _settingsPauseChangeInProgress = true;
+        UpdateSettingsLockStatus();
+        try
+        {
+            await SyncDistributedPollingStateAsync(showErrors: false, processIncomingRequests: false);
+
+            if (isPaused)
+            {
+                LogPollingLock("Settings toggle: user paused polling locally.");
+                _appState.EvernotePollingPaused = true;
+                _pendingTakeoverRequestId = null;
+                _pendingTakeoverTargetInstanceId = null;
+                _pendingTakeoverTargetDisplayName = null;
+                _pendingTakeoverMissingObservationCount = 0;
+            }
+            else
+            {
+                LogPollingLock("Settings toggle: user requested to resume polling.");
+                var localOwnsLock = string.Equals(_lockOwnerInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase);
+                var noCurrentOwner = string.IsNullOrWhiteSpace(_lockOwnerInstanceId);
+                if (localOwnsLock || noCurrentOwner)
+                {
+                    LogPollingLock($"Resume accepted immediately (localOwnsLock={localOwnsLock}, noCurrentOwner={noCurrentOwner}).");
+                    _appState.EvernotePollingPaused = false;
+                    _pendingTakeoverRequestId = null;
+                    _pendingTakeoverTargetInstanceId = null;
+                    _pendingTakeoverTargetDisplayName = null;
+                    _pendingTakeoverMissingObservationCount = 0;
+                }
+                else
+                {
+                    _appState.EvernotePollingPaused = true;
+                    _pendingTakeoverRequestId = Guid.NewGuid().ToString("N");
+                    _pendingTakeoverTargetInstanceId = _lockOwnerInstanceId;
+                    _pendingTakeoverTargetDisplayName = _lockOwnerDisplayName;
+                    _pendingTakeoverMissingObservationCount = 0;
+                    LogPollingLock($"Resume requires takeover request: {DescribePendingLocalRequest()}.");
+                }
+            }
+
+            ApplyEvernotePollingSettings();
+            SaveAppStateNow(queueGoogleDriveSync: false);
+            await SyncDistributedPollingStateAsync(showErrors: true, processIncomingRequests: false);
+            _ = SyncConfigToGoogleDriveAsync(showErrors: false);
+            LogPollingLock($"Pause toggle flow completed: paused={_appState.EvernotePollingPaused}, pending={DescribePendingLocalRequest()}.");
+        }
+        finally
+        {
+            _settingsPauseChangeInProgress = false;
+            UpdateSettingsLockStatus();
+        }
+    }
+
+    private async Task HandleForcePollingLockFromSettingsAsync()
+    {
+        if (_settingsForceLockInProgress)
+        {
+            return;
+        }
+
+        if (MessageBox.Show(
+                this,
+                "Cette action supprime tous les fichiers state dans Drive puis force ce poste comme lock owner actif. Continuer ?",
+                "Force lock",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning) != DialogResult.Yes)
+        {
+            return;
+        }
+
+        _settingsForceLockInProgress = true;
+        UpdateSettingsLockStatus();
+        try
+        {
+            if (!GoogleDriveConfigSyncService.IsConfigured(_appState))
+            {
+                _pendingTakeoverRequestId = null;
+                _pendingTakeoverTargetInstanceId = null;
+                _pendingTakeoverTargetDisplayName = null;
+                _pendingTakeoverMissingObservationCount = 0;
+                _appState.EvernotePollingPaused = false;
+                ApplyEvernotePollingSettings();
+                SaveAppStateNow(queueGoogleDriveSync: false);
+                _lockOwnerInstanceId = _localMachineInstanceId;
+                _lockOwnerDisplayName = GetLocalDisplayName();
+                return;
+            }
+
+            var deleteResult = await GoogleDriveConfigSyncService.DeleteAllPollingStatesAsync(_appState, CancellationToken.None);
+            LogPollingLock($"Force lock delete states: success={deleteResult.IsSuccess}, deleted={deleteResult.DeletedFiles}, error={deleteResult.Error ?? "none"}.");
+            if (!deleteResult.IsSuccess)
+            {
+                MessageBox.Show(
+                    this,
+                    $"Impossible de forcer le lock (suppression Drive).{Environment.NewLine}{Environment.NewLine}{deleteResult.Error}",
+                    "Force lock",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                return;
+            }
+
+            _pollingStateMetaSnapshot.Clear();
+            _cachedPollingStates = [];
+            _localMachineStateFileId = null;
+            _localMachineStateFileName = _localMachineDefaultStateFileName;
+
+            _pendingTakeoverRequestId = null;
+            _pendingTakeoverTargetInstanceId = null;
+            _pendingTakeoverTargetDisplayName = null;
+            _pendingTakeoverMissingObservationCount = 0;
+            _appState.EvernotePollingPaused = false;
+            ApplyEvernotePollingSettings();
+            SaveAppStateNow(queueGoogleDriveSync: false);
+
+            var localDocument = BuildLocalPollingStateDocument();
+            localDocument.PendingTakeoverRequest = null;
+            localDocument.PauseAutomaticPolling = false;
+            localDocument.UpdatedAtUtc = DateTimeOffset.UtcNow;
+            var upsert = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+                _appState,
+                _localMachineStateFileName,
+                localDocument,
+                _localMachineStateFileId,
+                CancellationToken.None);
+            LogPollingLock($"Force lock local upsert: success={upsert.IsSuccess}, fileId={upsert.FileId ?? "n/a"}, error={upsert.Error ?? "none"}.");
+            if (!upsert.IsSuccess)
+            {
+                MessageBox.Show(
+                    this,
+                    $"Impossible de finaliser le force lock.{Environment.NewLine}{Environment.NewLine}{upsert.Error}",
+                    "Force lock",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                return;
+            }
+
+            _localMachineStateFileId = upsert.FileId;
+            _lockOwnerInstanceId = _localMachineInstanceId;
+            _lockOwnerDisplayName = GetLocalDisplayName();
+            await SyncDistributedPollingStateAsync(showErrors: false, processIncomingRequests: false);
+        }
+        finally
+        {
+            _settingsForceLockInProgress = false;
+            UpdateSettingsLockStatus();
+        }
+    }
+
+    private void LogPollingLock(string message)
+    {
+        var line = $"[PollingLock:{_localMachineInstanceId}] {message}";
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {line}");
+        AppLogger.Info(line);
+    }
+
+    private string DescribePendingLocalRequest()
+    {
+        if (string.IsNullOrWhiteSpace(_pendingTakeoverRequestId))
+        {
+            return "none";
+        }
+
+        return $"id={_pendingTakeoverRequestId},target={_pendingTakeoverTargetDisplayName ?? _pendingTakeoverTargetInstanceId ?? "?"}";
+    }
+
+    private static string DescribePending(GoogleDrivePollingTakeoverRequest? request)
+    {
+        if (request is null || !request.IsActive)
+        {
+            return "none";
+        }
+
+        return $"id={request.RequestId},from={request.RequestedByDisplayName},to={request.RequestedToDisplayName},active={request.IsActive}";
     }
 
     private void ResetEvernoteTrackingBaseline()
@@ -2226,10 +3099,15 @@ internal sealed class MainForm : Form
         }
     }
 
-    private void OpenSettings()
+    private async void OpenSettings()
     {
-        var pausedBeforeDialog = _appState.EvernotePollingPaused;
-        var settingsImported = false;
+        if (_settingsFormOpenInstance is not null && !_settingsFormOpenInstance.IsDisposed)
+        {
+            _settingsFormOpenInstance.Activate();
+            _settingsFormOpenInstance.BringToFront();
+            return;
+        }
+
         using var settingsForm = new SettingsForm(
             _appState.CloseButtonBehavior,
             _appState.EvernotePollingIntervalMinutes,
@@ -2240,7 +3118,18 @@ internal sealed class MainForm : Form
             _appState.GoogleDriveClientId,
             _appState.GoogleDriveClientSecret,
             _appState.GoogleDriveConfigFileId);
-        settingsForm.EvernotePollingPausedChanged += isPaused => RefreshTrayPollingIconState(isPaused);
+        _settingsFormOpenInstance = settingsForm;
+        settingsForm.FormClosed += (_, _) =>
+        {
+            if (ReferenceEquals(_settingsFormOpenInstance, settingsForm))
+            {
+                _settingsFormOpenInstance = null;
+            }
+        };
+        UpdateSettingsLockStatus();
+        await SyncDistributedPollingStateAsync(showErrors: false, processIncomingRequests: false);
+        settingsForm.EvernotePollingPausedChanged += async isPaused => await HandlePausePollingToggleFromSettingsAsync(isPaused);
+        settingsForm.ForcePollingLockRequested += async () => await HandleForcePollingLockFromSettingsAsync();
         settingsForm.ExportSettingsRequested += () => ExportSettingsWithDialog(settingsForm);
         settingsForm.ImportSettingsRequested += () =>
         {
@@ -2249,17 +3138,12 @@ internal sealed class MainForm : Form
                 return;
             }
 
-            settingsImported = true;
             settingsForm.DialogResult = DialogResult.Cancel;
             settingsForm.Close();
         };
         if (settingsForm.ShowDialog(this) != DialogResult.OK)
         {
-            if (!settingsImported)
-            {
-                RefreshTrayPollingIconState(pausedBeforeDialog);
-            }
-
+            _settingsFormOpenInstance = null;
             return;
         }
 
@@ -2274,12 +3158,6 @@ internal sealed class MainForm : Form
         if (settingsForm.SelectedEvernotePollingIntervalMinutes != _appState.EvernotePollingIntervalMinutes)
         {
             _appState.EvernotePollingIntervalMinutes = settingsForm.SelectedEvernotePollingIntervalMinutes;
-            stateChanged = true;
-        }
-
-        if (settingsForm.IsEvernotePollingPaused != _appState.EvernotePollingPaused)
-        {
-            _appState.EvernotePollingPaused = settingsForm.IsEvernotePollingPaused;
             stateChanged = true;
         }
 
@@ -2322,12 +3200,15 @@ internal sealed class MainForm : Form
         if (!stateChanged)
         {
             RefreshTrayPollingIconState();
+            _settingsFormOpenInstance = null;
             return;
         }
 
         ApplyEvernotePollingSettings();
         SaveAppStateNow(queueGoogleDriveSync: false);
+        await SyncDistributedPollingStateAsync(showErrors: true, processIncomingRequests: false);
         _ = SyncConfigToGoogleDriveAsync(showErrors: true);
+        _settingsFormOpenInstance = null;
     }
 
     private void ExportSettingsWithDialog(IWin32Window owner)
@@ -2637,6 +3518,8 @@ internal sealed class MainForm : Form
         if (disposing)
         {
             _traySyncAnimationTimer.Dispose();
+            _settingsUiRefreshTimer.Dispose();
+            _pollingLockSyncTimer.Dispose();
             _googleDriveSyncTimer.Dispose();
             _evernotePollingTimer.Dispose();
             _topBarVisibilityTimer.Dispose();
