@@ -1,0 +1,2400 @@
+using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.WinForms;
+
+namespace WinGeminiWrapper;
+
+internal sealed class MainForm : Form
+{
+    private const int TopRevealThresholdPixels = 8;
+    private const int WindowStateSaveDebounceMs = 350;
+    private const int TopBarPollMs = 120;
+    private const int GoogleDriveSyncDebounceMs = 1200;
+    private const int EvernoteAutoExportCooldownSeconds = 30;
+
+    private readonly Panel _webViewHost;
+    private readonly Panel _evernoteExportPanel;
+    private readonly ToolStrip _topBar;
+    private readonly ToolStripComboBox _appSwitcher;
+    private readonly ContextMenuStrip _trayMenu;
+    private readonly NotifyIcon _trayIcon;
+    private readonly ContextMenuStrip _evernoteTreeNodeMenu;
+    private readonly TextBox _evernoteDbPathTextBox;
+    private readonly TreeView _evernoteTreeView;
+    private readonly Label _evernoteStatusLabel;
+    private readonly CheckBox _evernoteShowIgnoredCheckBox;
+    private readonly ProgressBar _evernoteExportProgressBar;
+    private readonly SemaphoreSlim _evernoteExportSemaphore = new(1, 1);
+    private readonly Dictionary<WrappedApp, WebView2> _webViews = new();
+    private readonly System.Windows.Forms.Timer _windowStateSaveTimer;
+    private readonly System.Windows.Forms.Timer _topBarVisibilityTimer;
+    private readonly System.Windows.Forms.Timer _evernotePollingTimer;
+    private readonly System.Windows.Forms.Timer _googleDriveSyncTimer;
+    private CoreWebView2Environment? _webViewEnvironment;
+    private AppState _appState;
+    private ToolStripMenuItem _switchAppMenuItem = null!;
+    private ToolStripMenuItem _toggleIgnoreEvernoteNodeMenuItem = null!;
+    private ToolStripMenuItem _setExportFileNameEvernoteNodeMenuItem = null!;
+    private ToolStripMenuItem _clearExportFileNameEvernoteNodeMenuItem = null!;
+    private TreeNode? _evernoteContextNode;
+    private bool _syncingEvernoteTreeChecks;
+    private bool _evernotePollingInProgress;
+    private DateTime _lastEvernoteAutoExportUtc = DateTime.MinValue;
+    private bool _googleDriveSyncInProgress;
+    private bool _suspendGoogleDriveSyncQueue;
+    private bool _syncingEvernoteShowIgnoredToggle;
+    private bool _exitRequested;
+    private bool _balloonShown;
+    private bool _logoutInProgress;
+    private WrappedApp _currentApp;
+
+    internal MainForm()
+    {
+        _appState = AppStateStore.Load();
+        _appState.Normalize();
+        _currentApp = Enum.IsDefined(typeof(WrappedApp), _appState.LastSelectedApp)
+            ? _appState.LastSelectedApp
+            : AppConfig.DefaultApp;
+
+        StartPosition = FormStartPosition.CenterScreen;
+        MinimumSize = new Size(980, 680);
+        Size = new Size(1320, 880);
+        Icon = AppIconProvider.GetIcon();
+        ApplySavedWindowPlacement();
+
+        _appSwitcher = BuildAppSwitcher();
+        _topBar = BuildTopBar();
+        _topBar.Visible = false;
+        _evernoteTreeNodeMenu = BuildEvernoteTreeNodeMenu();
+
+        _webViewHost = new Panel
+        {
+            Dock = DockStyle.Fill
+        };
+        (_evernoteExportPanel,
+            _evernoteDbPathTextBox,
+            _evernoteTreeView,
+            _evernoteStatusLabel,
+            _evernoteShowIgnoredCheckBox,
+            _evernoteExportProgressBar) = BuildEvernoteExportPanel();
+        _webViewHost.Controls.Add(_evernoteExportPanel);
+
+        Controls.Add(_webViewHost);
+        Controls.Add(_topBar);
+
+        _trayMenu = BuildTrayMenu();
+        _trayIcon = new NotifyIcon
+        {
+            Icon = AppIconProvider.GetIcon(),
+            Text = AppConfig.GetAppDisplayName(_currentApp),
+            ContextMenuStrip = _trayMenu,
+            Visible = true
+        };
+        _trayIcon.MouseClick += TrayIcon_MouseClick;
+
+        _windowStateSaveTimer = new System.Windows.Forms.Timer
+        {
+            Interval = WindowStateSaveDebounceMs
+        };
+        _windowStateSaveTimer.Tick += WindowStateSaveTimer_Tick;
+
+        _topBarVisibilityTimer = new System.Windows.Forms.Timer
+        {
+            Interval = TopBarPollMs
+        };
+        _topBarVisibilityTimer.Tick += TopBarVisibilityTimer_Tick;
+
+        _evernotePollingTimer = new System.Windows.Forms.Timer();
+        _evernotePollingTimer.Tick += EvernotePollingTimer_Tick;
+        ApplyEvernotePollingSettings();
+
+        _googleDriveSyncTimer = new System.Windows.Forms.Timer
+        {
+            Interval = GoogleDriveSyncDebounceMs
+        };
+        _googleDriveSyncTimer.Tick += GoogleDriveSyncTimer_Tick;
+
+        UpdateAppChrome();
+
+        Load += MainForm_Load;
+        Shown += MainForm_Shown;
+        Move += MainForm_WindowPlacementChanged;
+        Resize += MainForm_Resize;
+        SizeChanged += MainForm_WindowPlacementChanged;
+        FormClosing += MainForm_FormClosing;
+    }
+
+    private async void MainForm_Load(object? sender, EventArgs e)
+    {
+        try
+        {
+            Directory.CreateDirectory(AppConfig.WebViewUserDataFolder);
+            Directory.CreateDirectory(AppConfig.AppDataRootFolder);
+            await TryAutoRestoreConfigFromGoogleDriveAsync();
+
+            _currentApp = Enum.IsDefined(typeof(WrappedApp), _appState.LastSelectedApp)
+                ? _appState.LastSelectedApp
+                : AppConfig.DefaultApp;
+            if (_appSwitcher.SelectedIndex != (int)_currentApp)
+            {
+                _appSwitcher.SelectedIndex = (int)_currentApp;
+            }
+
+            _evernoteDbPathTextBox.Text = GetConfiguredEvernoteRootPath() ?? string.Empty;
+            SyncEvernoteShowIgnoredCheckboxFromState();
+            ApplyEvernotePollingSettings();
+            UpdateAppChrome();
+
+            _webViewEnvironment = await CoreWebView2Environment.CreateAsync(
+                userDataFolder: AppConfig.WebViewUserDataFolder);
+
+            await EnsureWebViewInitializedAsync(WrappedApp.Gemini);
+            await EnsureWebViewInitializedAsync(WrappedApp.NotebookLm);
+            await EnsureWebViewInitializedAsync(WrappedApp.GoogleDrive);
+            ShowActiveContent();
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show(
+                this,
+                $"Unable to start application window.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
+                "Startup Error",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+
+            _exitRequested = true;
+            Close();
+        }
+    }
+
+    private void MainForm_Shown(object? sender, EventArgs e)
+    {
+        CaptureWindowPlacement();
+        QueueAppStateSave();
+        _topBarVisibilityTimer.Start();
+        ApplyEvernotePollingSettings();
+        LoadEvernoteTreeFromConfiguredRoot(showErrors: false);
+        UpdateTopBarVisibility();
+    }
+
+    private async Task TryAutoRestoreConfigFromGoogleDriveAsync()
+    {
+        var hasLocalConfigFile = File.Exists(AppConfig.LocalConfigFilePath) || File.Exists(AppConfig.LegacyStateFilePath);
+        if (!GoogleDriveConfigSyncService.IsConfigured(_appState) &&
+            TryAttachGoogleDriveCredentialsFromDefaultFile(out var loadedPath))
+        {
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive OAuth client loaded from: {loadedPath}");
+            if (!hasLocalConfigFile)
+            {
+                _appState.GoogleDriveSyncEnabled = true;
+                _appState.GoogleDriveAutoRestoreOnStartup = true;
+            }
+        }
+
+        var shouldAttemptAutoRestore = _appState.GoogleDriveAutoRestoreOnStartup || !hasLocalConfigFile;
+        if (!shouldAttemptAutoRestore || !GoogleDriveConfigSyncService.IsConfigured(_appState))
+        {
+            return;
+        }
+
+        var localFallbackState = _appState;
+
+        var downloadResult = await GoogleDriveConfigSyncService.DownloadConfigAsync(_appState, CancellationToken.None);
+        if (downloadResult.IsNotFound)
+        {
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive config auto-restore: no remote config found.");
+            return;
+        }
+
+        if (!downloadResult.IsSuccess)
+        {
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive config auto-restore failed: {downloadResult.Error}");
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(downloadResult.ConfigJson) ||
+            !AppStateStore.TryDeserialize(downloadResult.ConfigJson, out var remoteState))
+        {
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive config auto-restore skipped: invalid remote JSON.");
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(remoteState.GoogleDriveClientId))
+        {
+            remoteState.GoogleDriveClientId = localFallbackState.GoogleDriveClientId;
+        }
+
+        if (string.IsNullOrWhiteSpace(remoteState.GoogleDriveClientSecret))
+        {
+            remoteState.GoogleDriveClientSecret = localFallbackState.GoogleDriveClientSecret;
+        }
+
+        if (string.IsNullOrWhiteSpace(remoteState.GoogleDriveConfigFileId))
+        {
+            remoteState.GoogleDriveConfigFileId = downloadResult.FileId ?? localFallbackState.GoogleDriveConfigFileId;
+        }
+
+        remoteState.GoogleDriveSyncEnabled = localFallbackState.GoogleDriveSyncEnabled || remoteState.GoogleDriveSyncEnabled;
+        remoteState.GoogleDriveAutoRestoreOnStartup =
+            localFallbackState.GoogleDriveAutoRestoreOnStartup || remoteState.GoogleDriveAutoRestoreOnStartup;
+
+        _appState = remoteState;
+        _appState.Normalize();
+
+        _suspendGoogleDriveSyncQueue = true;
+        try
+        {
+            AppStateStore.Save(_appState);
+        }
+        finally
+        {
+            _suspendGoogleDriveSyncQueue = false;
+        }
+
+        var modifiedInfo = downloadResult.ModifiedTimeUtc?.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") ?? "unknown";
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Config restored from Google Drive (modified: {modifiedInfo}).");
+    }
+
+    private bool TryAttachGoogleDriveCredentialsFromDefaultFile(out string sourcePath)
+    {
+        sourcePath = string.Empty;
+        if (!GoogleDriveConfigSyncService.TryLoadClientSecretsFromDefaultLocations(
+                out var clientId,
+                out var clientSecret,
+                out sourcePath,
+                out var error))
+        {
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive OAuth client not available: {error}");
+            return false;
+        }
+
+        _appState.GoogleDriveClientId = clientId;
+        _appState.GoogleDriveClientSecret = clientSecret;
+        return true;
+    }
+
+    private async Task EnsureWebViewInitializedAsync(WrappedApp app)
+    {
+        if (_webViews.ContainsKey(app))
+        {
+            return;
+        }
+
+        if (_webViewEnvironment is null)
+        {
+            throw new InvalidOperationException("WebView2 environment was not initialized.");
+        }
+
+        var webView = new WebView2
+        {
+            Dock = DockStyle.Fill,
+            Visible = false
+        };
+
+        _webViews[app] = webView;
+        _webViewHost.Controls.Add(webView);
+
+        await webView.EnsureCoreWebView2Async(_webViewEnvironment);
+        ConfigureWebView(webView, app);
+        webView.CoreWebView2.Navigate(GetStartupUrl(app));
+    }
+
+    private void ConfigureWebView(WebView2 webView, WrappedApp app)
+    {
+        var coreWebView2 = webView.CoreWebView2;
+        coreWebView2.Settings.IsStatusBarEnabled = false;
+        coreWebView2.NewWindowRequested += (_, e) => CoreWebView2_NewWindowRequested(coreWebView2, e);
+        coreWebView2.SourceChanged += (_, _) => PersistLastUrl(app, webView.Source);
+    }
+
+    private void CoreWebView2_NewWindowRequested(CoreWebView2 coreWebView2, CoreWebView2NewWindowRequestedEventArgs e)
+    {
+        e.Handled = true;
+        if (!string.IsNullOrWhiteSpace(e.Uri))
+        {
+            coreWebView2.Navigate(e.Uri);
+        }
+    }
+
+    private string GetStartupUrl(WrappedApp app)
+    {
+        var previousUrl = _appState.GetLastUrl(app);
+        if (Uri.TryCreate(previousUrl, UriKind.Absolute, out var previousUri) &&
+            NavigationClassifier.IsUriForApp(previousUri, app))
+        {
+            return previousUri.AbsoluteUri;
+        }
+
+        return AppConfig.GetAppUrl(app);
+    }
+
+    private void PersistLastUrl(WrappedApp app, Uri? sourceUri)
+    {
+        if (sourceUri is null || !NavigationClassifier.IsUriForApp(sourceUri, app))
+        {
+            return;
+        }
+
+        var absoluteUri = sourceUri.AbsoluteUri;
+        if (string.Equals(_appState.GetLastUrl(app), absoluteUri, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        _appState.SetLastUrl(app, absoluteUri);
+        QueueAppStateSave();
+    }
+
+    private ToolStripComboBox BuildAppSwitcher()
+    {
+        var switcher = new ToolStripComboBox
+        {
+            AutoSize = false,
+            Width = 170,
+            DropDownStyle = ComboBoxStyle.DropDownList
+        };
+
+        foreach (var app in Enum.GetValues<WrappedApp>())
+        {
+            switcher.Items.Add(AppConfig.GetAppDisplayName(app));
+        }
+
+        switcher.SelectedIndex = (int)_currentApp;
+        switcher.SelectedIndexChanged += AppSwitcher_SelectedIndexChanged;
+
+        return switcher;
+    }
+
+    private ToolStrip BuildTopBar()
+    {
+        var topBar = new ToolStrip
+        {
+            Dock = DockStyle.Top,
+            GripStyle = ToolStripGripStyle.Hidden,
+            RenderMode = ToolStripRenderMode.System
+        };
+        var logoutButton = new ToolStripButton("Log out", null, async (_, _) => await LogoutAsync())
+        {
+            Alignment = ToolStripItemAlignment.Right
+        };
+
+        topBar.Items.Add(new ToolStripLabel("App:"));
+        topBar.Items.Add(_appSwitcher);
+        topBar.Items.Add(new ToolStripSeparator());
+        topBar.Items.Add(new ToolStripButton("Refresh", null, (_, _) => RefreshCurrentApp()));
+        topBar.Items.Add(new ToolStripButton("Settings", null, (_, _) => OpenSettings()));
+        topBar.Items.Add(logoutButton);
+
+        return topBar;
+    }
+
+    private ContextMenuStrip BuildTrayMenu()
+    {
+        var menu = new ContextMenuStrip();
+        _switchAppMenuItem = new ToolStripMenuItem("Switch to");
+        menu.Opening += (_, _) => UpdateTrayMenuItems();
+
+        menu.Items.Add(_switchAppMenuItem);
+        menu.Items.Add("Refresh", null, (_, _) => RefreshCurrentApp());
+        menu.Items.Add("Settings", null, (_, _) => OpenSettings());
+        menu.Items.Add("Log out", null, async (_, _) => await LogoutAsync());
+        menu.Items.Add("Exit", null, (_, _) => ExitApplication());
+        UpdateTrayMenuItems();
+
+        return menu;
+    }
+
+    private ContextMenuStrip BuildEvernoteTreeNodeMenu()
+    {
+        var menu = new ContextMenuStrip();
+        _toggleIgnoreEvernoteNodeMenuItem = new ToolStripMenuItem("Ignore");
+        _toggleIgnoreEvernoteNodeMenuItem.Click += (_, _) => ToggleIgnoreForContextNode();
+        _setExportFileNameEvernoteNodeMenuItem = new ToolStripMenuItem("Set export file name...");
+        _setExportFileNameEvernoteNodeMenuItem.Click += (_, _) => SetExportFileNameForContextNode();
+        _clearExportFileNameEvernoteNodeMenuItem = new ToolStripMenuItem("Clear export file name");
+        _clearExportFileNameEvernoteNodeMenuItem.Click += (_, _) => ClearExportFileNameForContextNode();
+        menu.Items.Add(_toggleIgnoreEvernoteNodeMenuItem);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(_setExportFileNameEvernoteNodeMenuItem);
+        menu.Items.Add(_clearExportFileNameEvernoteNodeMenuItem);
+        menu.Opening += (_, _) => UpdateEvernoteNodeMenuState();
+        return menu;
+    }
+
+    private (
+        Panel Panel,
+        TextBox PathTextBox,
+        TreeView TreeView,
+        Label StatusLabel,
+        CheckBox ShowIgnoredCheckBox,
+        ProgressBar ExportProgressBar) BuildEvernoteExportPanel()
+    {
+        var container = new Panel
+        {
+            Dock = DockStyle.Fill,
+            Visible = false
+        };
+
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 8,
+            Padding = new Padding(16)
+        };
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        var titleLabel = new Label
+        {
+            AutoSize = true,
+            Font = new Font(Font, FontStyle.Bold),
+            Text = "Evernote Export"
+        };
+
+        var subtitleLabel = new Label
+        {
+            AutoSize = true,
+            Margin = new Padding(0, 8, 0, 12),
+            Text = "Selectionne le dossier racine Evernote, puis exporte les notebooks coches. Clic droit: ignorer ou definir le nom de fichier d'export."
+        };
+
+        var rootPathLayout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            ColumnCount = 2,
+            AutoSize = true
+        };
+        rootPathLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        rootPathLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+        var rootPathTextBox = new TextBox
+        {
+            Dock = DockStyle.Fill,
+            ReadOnly = true
+        };
+
+        var chooseRootFolderButton = new Button
+        {
+            AutoSize = true,
+            Margin = new Padding(8, 0, 0, 0),
+            Text = "Dossier Evernote..."
+        };
+        chooseRootFolderButton.Click += (_, _) => ChooseEvernoteRootPath();
+
+        rootPathLayout.Controls.Add(rootPathTextBox, 0, 0);
+        rootPathLayout.Controls.Add(chooseRootFolderButton, 1, 0);
+
+        var actionsLayout = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Margin = new Padding(0, 10, 0, 0)
+        };
+
+        var reloadButton = new Button
+        {
+            AutoSize = true,
+            Text = "Recharger"
+        };
+        reloadButton.Click += (_, _) => LoadEvernoteTreeFromConfiguredRoot(showErrors: true);
+
+        var exportButton = new Button
+        {
+            AutoSize = true,
+            Margin = new Padding(8, 0, 0, 0),
+            Text = "Export"
+        };
+        exportButton.Click += async (_, _) => await ExportSelectedEvernoteContentToMarkdownAsync(
+            showDialogs: true,
+            source: "manual",
+            targetExportFileNames: null);
+
+        actionsLayout.Controls.Add(reloadButton);
+        actionsLayout.Controls.Add(exportButton);
+
+        var statusLabel = new Label
+        {
+            AutoSize = true,
+            Margin = new Padding(0, 8, 0, 0),
+            Text = "Aucun dossier Evernote selectionne."
+        };
+
+        var treeHeaderLayout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            AutoSize = true,
+            Margin = new Padding(0, 8, 0, 0)
+        };
+        treeHeaderLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        treeHeaderLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+        var showIgnoredCheckBox = new CheckBox
+        {
+            AutoSize = true,
+            Text = "Afficher ignores",
+            Checked = _appState.EvernoteShowIgnoredItems,
+            Anchor = AnchorStyles.Right
+        };
+        showIgnoredCheckBox.CheckedChanged += EvernoteShowIgnoredCheckBox_CheckedChanged;
+
+        treeHeaderLayout.Controls.Add(new Label { AutoSize = true, Text = string.Empty }, 0, 0);
+        treeHeaderLayout.Controls.Add(showIgnoredCheckBox, 1, 0);
+
+        var exportProgressBar = new ProgressBar
+        {
+            Dock = DockStyle.Fill,
+            Style = ProgressBarStyle.Continuous,
+            Visible = false,
+            Minimum = 0,
+            Maximum = 1,
+            Value = 0
+        };
+
+        var treeView = new TreeView
+        {
+            Dock = DockStyle.Fill,
+            CheckBoxes = true,
+            HideSelection = false
+        };
+        treeView.AfterCheck += EvernoteTreeView_AfterCheck;
+        treeView.NodeMouseClick += EvernoteTreeView_NodeMouseClick;
+        treeView.BeforeExpand += EvernoteTreeView_BeforeExpand;
+
+        layout.Controls.Add(titleLabel, 0, 0);
+        layout.Controls.Add(subtitleLabel, 0, 1);
+        layout.Controls.Add(rootPathLayout, 0, 2);
+        layout.Controls.Add(actionsLayout, 0, 3);
+        layout.Controls.Add(statusLabel, 0, 4);
+        layout.Controls.Add(treeHeaderLayout, 0, 5);
+        layout.Controls.Add(exportProgressBar, 0, 6);
+        layout.Controls.Add(treeView, 0, 7);
+
+        container.Controls.Add(layout);
+
+        var configuredRootPath = GetConfiguredEvernoteRootPath();
+        rootPathTextBox.Text = configuredRootPath ?? string.Empty;
+        return (container, rootPathTextBox, treeView, statusLabel, showIgnoredCheckBox, exportProgressBar);
+    }
+
+    private void EvernoteShowIgnoredCheckBox_CheckedChanged(object? sender, EventArgs e)
+    {
+        if (_syncingEvernoteShowIgnoredToggle)
+        {
+            return;
+        }
+
+        var shouldShowIgnored = _evernoteShowIgnoredCheckBox.Checked;
+        if (_appState.EvernoteShowIgnoredItems == shouldShowIgnored)
+        {
+            return;
+        }
+
+        _appState.EvernoteShowIgnoredItems = shouldShowIgnored;
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Evernote show ignored set: {shouldShowIgnored}");
+        QueueAppStateSave();
+        LoadEvernoteTreeFromConfiguredRoot(showErrors: false, refreshTracking: false);
+    }
+
+    private void ChooseEvernoteRootPath()
+    {
+        var currentPath = GetConfiguredEvernoteRootPath();
+        using var dialog = new FolderBrowserDialog
+        {
+            Description = "Choisir le dossier racine de l'installation Evernote",
+            ShowNewFolderButton = false
+        };
+
+        if (!string.IsNullOrWhiteSpace(currentPath) && Directory.Exists(currentPath))
+        {
+            dialog.SelectedPath = currentPath;
+        }
+
+        if (dialog.ShowDialog(this) != DialogResult.OK || string.IsNullOrWhiteSpace(dialog.SelectedPath))
+        {
+            return;
+        }
+
+        var selectedPath = Path.GetFullPath(dialog.SelectedPath);
+        if (string.Equals(currentPath, selectedPath, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        _appState.EvernoteLocalDbPath = selectedPath;
+        _evernoteDbPathTextBox.Text = selectedPath;
+        ResetEvernoteTrackingBaseline();
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Evernote root path set: {selectedPath}");
+        QueueAppStateSave();
+
+        LoadEvernoteTreeFromConfiguredRoot(showErrors: true);
+    }
+
+    private string? GetConfiguredEvernoteRootPath()
+    {
+        var savedPath = _appState.EvernoteLocalDbPath;
+        if (string.IsNullOrWhiteSpace(savedPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            if (File.Exists(savedPath))
+            {
+                return Path.GetDirectoryName(Path.GetFullPath(savedPath));
+            }
+
+            return Path.GetFullPath(savedPath);
+        }
+        catch
+        {
+            return savedPath;
+        }
+    }
+
+    private void LoadEvernoteTreeFromConfiguredRoot(bool showErrors, bool refreshTracking = true)
+    {
+        var rootPath = GetConfiguredEvernoteRootPath();
+        if (string.IsNullOrWhiteSpace(rootPath))
+        {
+            PopulateEvernoteTree([]);
+            SetEvernoteStatus("Aucun dossier Evernote selectionne.");
+            return;
+        }
+
+        try
+        {
+            var stacks = EvernoteLocalDbService.GetStacksAndNotebooks(rootPath, out var dbPath);
+            PopulateEvernoteTree(stacks);
+            SetEvernoteStatus(
+                $"DB detectee: {dbPath} | Stacks: {stacks.Count} | Notebooks: {stacks.Sum(stack => stack.Notebooks.Count)}");
+            if (refreshTracking)
+            {
+                PollEvernoteTracking(allowAutoExport: false, showErrors: false, ignorePause: true);
+            }
+        }
+        catch (Exception exception)
+        {
+            PopulateEvernoteTree([]);
+            SetEvernoteStatus($"Erreur DB: {exception.Message}");
+            if (showErrors)
+            {
+                MessageBox.Show(
+                    this,
+                    $"Impossible de lire la base Evernote.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
+                    "Evernote Export",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+        }
+    }
+
+    private void SetEvernoteStatus(string message)
+    {
+        _evernoteStatusLabel.Text = message;
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Evernote status: {message}");
+    }
+
+    private void SyncEvernoteShowIgnoredCheckboxFromState()
+    {
+        _syncingEvernoteShowIgnoredToggle = true;
+        try
+        {
+            _evernoteShowIgnoredCheckBox.Checked = _appState.EvernoteShowIgnoredItems;
+        }
+        finally
+        {
+            _syncingEvernoteShowIgnoredToggle = false;
+        }
+    }
+
+    private void PopulateEvernoteTree(IReadOnlyList<EvernoteStackInfo> stacks)
+    {
+        _syncingEvernoteTreeChecks = true;
+        _evernoteTreeView.BeginUpdate();
+
+        try
+        {
+            _evernoteTreeView.Nodes.Clear();
+            var showIgnoredItems = _appState.EvernoteShowIgnoredItems;
+            foreach (var stack in stacks)
+            {
+                var stackIgnored = _appState.IsEvernoteStackIgnored(stack.Id);
+                if (stackIgnored && !showIgnoredItems)
+                {
+                    continue;
+                }
+
+                var notebooksToDisplay = stack.Notebooks
+                    .Where(notebook => showIgnoredItems || !_appState.IsEvernoteNotebookIgnored(notebook.Id))
+                    .ToArray();
+                if (notebooksToDisplay.Length == 0 && !showIgnoredItems)
+                {
+                    continue;
+                }
+
+                var stackExportFileName = _appState.GetEvernoteStackExportFileName(stack.Id);
+                var stackNode = new TreeNode(
+                    FormatStackNodeText(
+                        stack.DisplayName,
+                        notebooksToDisplay.Length,
+                        stack.LatestChangeMs,
+                        stackIgnored,
+                        stackExportFileName))
+                {
+                    Tag = new EvernoteTreeNodeTag(
+                        EvernoteTreeNodeKind.Stack,
+                        stack.Id,
+                        stack.DisplayName,
+                        notebooksToDisplay.Length,
+                        stack.LatestChangeMs)
+                };
+
+                var anyNotebookSelected = false;
+                foreach (var notebook in notebooksToDisplay)
+                {
+                    var notebookSelected = _appState.IsEvernoteNotebookSelected(notebook.Id);
+                    anyNotebookSelected = anyNotebookSelected || notebookSelected;
+                    var notebookIgnored = _appState.IsEvernoteNotebookIgnored(notebook.Id);
+                    var notebookExportFileName = _appState.GetEvernoteNotebookExportFileName(notebook.Id);
+
+                    stackNode.Nodes.Add(new TreeNode(
+                        FormatNotebookNodeText(
+                            notebook.Name,
+                            notebook.NoteCount,
+                            notebook.LatestChangeMs,
+                            notebookIgnored,
+                            notebookExportFileName))
+                    {
+                        Tag = new EvernoteTreeNodeTag(
+                            EvernoteTreeNodeKind.Notebook,
+                            notebook.Id,
+                            notebook.Name,
+                            notebook.NoteCount,
+                            notebook.LatestChangeMs),
+                        Checked = notebookSelected
+                    });
+                }
+
+                stackNode.Checked = _appState.IsEvernoteStackSelected(stack.Id) || anyNotebookSelected;
+                ApplyIgnoreVisualState(stackNode);
+                _evernoteTreeView.Nodes.Add(stackNode);
+                if (stackIgnored)
+                {
+                    stackNode.Collapse();
+                }
+                else
+                {
+                    stackNode.Expand();
+                }
+            }
+        }
+        finally
+        {
+            _evernoteTreeView.EndUpdate();
+            _syncingEvernoteTreeChecks = false;
+        }
+    }
+
+    private static string FormatStackNodeText(
+        string stackName,
+        int notebookCount,
+        long? latestChangeMs,
+        bool ignored,
+        string? exportFileName)
+    {
+        var suffix = ignored ? " [ignored]" : string.Empty;
+        var dateText = FormatEvernoteTimestamp(latestChangeMs);
+        var dateSuffix = string.IsNullOrWhiteSpace(dateText) ? string.Empty : $" | maj: {dateText}";
+        var exportSuffix = string.IsNullOrWhiteSpace(exportFileName) ? string.Empty : $" | export: {exportFileName}.md";
+        return $"{stackName} ({notebookCount} notebooks){exportSuffix}{dateSuffix}{suffix}";
+    }
+
+    private static string FormatNotebookNodeText(
+        string notebookName,
+        int noteCount,
+        long? latestChangeMs,
+        bool ignored,
+        string? exportFileName)
+    {
+        var suffix = ignored ? " [ignored]" : string.Empty;
+        var dateText = FormatEvernoteTimestamp(latestChangeMs);
+        var dateSuffix = string.IsNullOrWhiteSpace(dateText) ? string.Empty : $" | maj: {dateText}";
+        var exportSuffix = string.IsNullOrWhiteSpace(exportFileName) ? string.Empty : $" | export: {exportFileName}.md";
+        return $"{notebookName} ({noteCount} notes){exportSuffix}{dateSuffix}{suffix}";
+    }
+
+    private static string FormatEvernoteTimestamp(long? timestampMs)
+    {
+        if (!timestampMs.HasValue)
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            return DateTimeOffset.FromUnixTimeMilliseconds(timestampMs.Value).ToLocalTime().ToString("yyyy-MM-dd HH:mm");
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static string SanitizeExportFileBaseName(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        var normalized = value.Trim();
+        foreach (var invalidChar in Path.GetInvalidFileNameChars())
+        {
+            normalized = normalized.Replace(invalidChar, '_');
+        }
+
+        normalized = normalized.Replace(".md", string.Empty, StringComparison.OrdinalIgnoreCase).Trim();
+        while (normalized.Contains("  ", StringComparison.Ordinal))
+        {
+            normalized = normalized.Replace("  ", " ", StringComparison.Ordinal);
+        }
+
+        return normalized;
+    }
+
+    private void EvernoteTreeView_NodeMouseClick(object? sender, TreeNodeMouseClickEventArgs e)
+    {
+        if (e.Button != MouseButtons.Right || e.Node.Tag is not EvernoteTreeNodeTag)
+        {
+            return;
+        }
+
+        _evernoteContextNode = e.Node;
+        _evernoteTreeView.SelectedNode = e.Node;
+        _evernoteTreeNodeMenu.Show(_evernoteTreeView, e.Location);
+    }
+
+    private void EvernoteTreeView_BeforeExpand(object? sender, TreeViewCancelEventArgs e)
+    {
+        var node = e.Node;
+        if (node is null || node.Tag is not EvernoteTreeNodeTag tag || tag.Kind != EvernoteTreeNodeKind.Stack)
+        {
+            return;
+        }
+
+        if (_appState.IsEvernoteStackIgnored(tag.Id))
+        {
+            e.Cancel = true;
+        }
+    }
+
+    private void UpdateEvernoteNodeMenuState()
+    {
+        var node = _evernoteContextNode;
+        if (node?.Tag is not EvernoteTreeNodeTag tag)
+        {
+            _toggleIgnoreEvernoteNodeMenuItem.Enabled = false;
+            _toggleIgnoreEvernoteNodeMenuItem.Text = "Ignore";
+            _setExportFileNameEvernoteNodeMenuItem.Enabled = false;
+            _clearExportFileNameEvernoteNodeMenuItem.Enabled = false;
+            return;
+        }
+
+        var ignored = tag.Kind == EvernoteTreeNodeKind.Stack
+            ? _appState.IsEvernoteStackIgnored(tag.Id)
+            : _appState.IsEvernoteNotebookIgnored(tag.Id);
+        var currentExportFileName = tag.Kind == EvernoteTreeNodeKind.Stack
+            ? _appState.GetEvernoteStackExportFileName(tag.Id)
+            : _appState.GetEvernoteNotebookExportFileName(tag.Id);
+
+        _toggleIgnoreEvernoteNodeMenuItem.Enabled = true;
+        _toggleIgnoreEvernoteNodeMenuItem.Text = ignored
+            ? $"Unignore {tag.Kind.ToString().ToLowerInvariant()}"
+            : $"Ignore {tag.Kind.ToString().ToLowerInvariant()}";
+        _setExportFileNameEvernoteNodeMenuItem.Enabled = true;
+        _setExportFileNameEvernoteNodeMenuItem.Text = $"Set export file for {tag.Kind.ToString().ToLowerInvariant()}...";
+        _clearExportFileNameEvernoteNodeMenuItem.Enabled = !string.IsNullOrWhiteSpace(currentExportFileName);
+        _clearExportFileNameEvernoteNodeMenuItem.Text = string.IsNullOrWhiteSpace(currentExportFileName)
+            ? "Clear export file name"
+            : $"Clear export file ({currentExportFileName})";
+    }
+
+    private void ToggleIgnoreForContextNode()
+    {
+        var node = _evernoteContextNode;
+        if (node?.Tag is not EvernoteTreeNodeTag tag)
+        {
+            return;
+        }
+
+        if (tag.Kind == EvernoteTreeNodeKind.Stack)
+        {
+            var willIgnore = !_appState.IsEvernoteStackIgnored(tag.Id);
+            _appState.SetEvernoteStackIgnored(tag.Id, willIgnore);
+            LogEvernoteIgnoreChange("Stack", tag.Name, tag.Id, willIgnore);
+            if (willIgnore)
+            {
+                node.Collapse();
+            }
+        }
+        else
+        {
+            var willIgnore = !_appState.IsEvernoteNotebookIgnored(tag.Id);
+            _appState.SetEvernoteNotebookIgnored(tag.Id, willIgnore);
+            LogEvernoteIgnoreChange("Notebook", tag.Name, tag.Id, willIgnore);
+        }
+
+        UpdateNodeTextFromTag(node);
+        ApplyIgnoreVisualState(node);
+        if (node.Parent is not null)
+        {
+            UpdateNodeTextFromTag(node.Parent);
+            ApplyIgnoreVisualState(node.Parent);
+        }
+
+        QueueAppStateSave();
+    }
+
+    private void SetExportFileNameForContextNode()
+    {
+        var node = _evernoteContextNode;
+        if (node?.Tag is not EvernoteTreeNodeTag tag)
+        {
+            return;
+        }
+
+        var currentValue = tag.Kind == EvernoteTreeNodeKind.Stack
+            ? _appState.GetEvernoteStackExportFileName(tag.Id)
+            : _appState.GetEvernoteNotebookExportFileName(tag.Id);
+
+        var proposedValue = PromptForExportFileName(tag.Name, currentValue);
+        if (proposedValue is null)
+        {
+            return;
+        }
+
+        if (tag.Kind == EvernoteTreeNodeKind.Stack)
+        {
+            _appState.SetEvernoteStackExportFileName(tag.Id, proposedValue);
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Stack export file set: {tag.Name} ({tag.Id}) -> {proposedValue}");
+        }
+        else
+        {
+            _appState.SetEvernoteNotebookExportFileName(tag.Id, proposedValue);
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Notebook export file set: {tag.Name} ({tag.Id}) -> {proposedValue}");
+        }
+
+        UpdateNodeTextFromTag(node);
+        if (node.Parent is not null)
+        {
+            UpdateNodeTextFromTag(node.Parent);
+        }
+
+        QueueAppStateSave();
+    }
+
+    private void ClearExportFileNameForContextNode()
+    {
+        var node = _evernoteContextNode;
+        if (node?.Tag is not EvernoteTreeNodeTag tag)
+        {
+            return;
+        }
+
+        if (tag.Kind == EvernoteTreeNodeKind.Stack)
+        {
+            _appState.SetEvernoteStackExportFileName(tag.Id, null);
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Stack export file cleared: {tag.Name} ({tag.Id})");
+        }
+        else
+        {
+            _appState.SetEvernoteNotebookExportFileName(tag.Id, null);
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Notebook export file cleared: {tag.Name} ({tag.Id})");
+        }
+
+        UpdateNodeTextFromTag(node);
+        if (node.Parent is not null)
+        {
+            UpdateNodeTextFromTag(node.Parent);
+        }
+
+        QueueAppStateSave();
+    }
+
+    private string? PromptForExportFileName(string containerName, string? currentValue)
+    {
+        using var dialog = new Form
+        {
+            Text = "Export File Name",
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MaximizeBox = false,
+            MinimizeBox = false,
+            ShowInTaskbar = false,
+            Width = 520,
+            Height = 190
+        };
+
+        var label = new Label
+        {
+            Left = 12,
+            Top = 12,
+            Width = 480,
+            Text = $"Nom de fichier d'export pour {containerName} (sans .md):"
+        };
+
+        var textBox = new TextBox
+        {
+            Left = 12,
+            Top = 38,
+            Width = 480,
+            Text = currentValue ?? string.Empty
+        };
+
+        var hint = new Label
+        {
+            Left = 12,
+            Top = 66,
+            Width = 480,
+            Text = "Le meme nom permet de grouper plusieurs stacks/notebooks."
+        };
+
+        var okButton = new Button
+        {
+            Text = "Save",
+            Left = 326,
+            Top = 98,
+            Width = 80,
+            DialogResult = DialogResult.OK
+        };
+
+        var cancelButton = new Button
+        {
+            Text = "Cancel",
+            Left = 412,
+            Top = 98,
+            Width = 80,
+            DialogResult = DialogResult.Cancel
+        };
+
+        dialog.Controls.Add(label);
+        dialog.Controls.Add(textBox);
+        dialog.Controls.Add(hint);
+        dialog.Controls.Add(okButton);
+        dialog.Controls.Add(cancelButton);
+        dialog.AcceptButton = okButton;
+        dialog.CancelButton = cancelButton;
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return null;
+        }
+
+        var sanitized = SanitizeExportFileBaseName(textBox.Text);
+        if (string.IsNullOrWhiteSpace(sanitized))
+        {
+            MessageBox.Show(
+                this,
+                "Nom invalide. Utilise au moins un caractere valide.",
+                "Evernote Export",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return null;
+        }
+
+        return sanitized;
+    }
+
+    private void UpdateNodeTextFromTag(TreeNode node)
+    {
+        if (node.Tag is not EvernoteTreeNodeTag tag)
+        {
+            return;
+        }
+
+        if (tag.Kind == EvernoteTreeNodeKind.Stack)
+        {
+            node.Text = FormatStackNodeText(
+                tag.Name,
+                tag.ItemCount,
+                tag.LatestChangeMs,
+                _appState.IsEvernoteStackIgnored(tag.Id),
+                _appState.GetEvernoteStackExportFileName(tag.Id));
+            return;
+        }
+
+        node.Text = FormatNotebookNodeText(
+            tag.Name,
+            tag.ItemCount,
+            tag.LatestChangeMs,
+            _appState.IsEvernoteNotebookIgnored(tag.Id),
+            _appState.GetEvernoteNotebookExportFileName(tag.Id));
+    }
+
+    private void ApplyIgnoreVisualState(TreeNode node)
+    {
+        if (node.Tag is not EvernoteTreeNodeTag tag)
+        {
+            return;
+        }
+
+        if (tag.Kind == EvernoteTreeNodeKind.Stack)
+        {
+            var ignored = _appState.IsEvernoteStackIgnored(tag.Id);
+            node.ForeColor = ignored ? SystemColors.GrayText : SystemColors.WindowText;
+            foreach (TreeNode child in node.Nodes)
+            {
+                ApplyIgnoreVisualState(child);
+            }
+
+            if (ignored)
+            {
+                node.Collapse();
+            }
+
+            return;
+        }
+
+        var parentIgnored = node.Parent?.Tag is EvernoteTreeNodeTag parentTag &&
+                            parentTag.Kind == EvernoteTreeNodeKind.Stack &&
+                            _appState.IsEvernoteStackIgnored(parentTag.Id);
+        var notebookIgnored = _appState.IsEvernoteNotebookIgnored(tag.Id);
+        node.ForeColor = parentIgnored || notebookIgnored ? SystemColors.GrayText : SystemColors.WindowText;
+    }
+
+    private async Task<bool> ExportSelectedEvernoteContentToMarkdownAsync(
+        bool showDialogs,
+        string source,
+        IReadOnlyCollection<string>? targetExportFileNames)
+    {
+        if (!await _evernoteExportSemaphore.WaitAsync(0))
+        {
+            var message = "Un export est deja en cours.";
+            if (showDialogs)
+            {
+                MessageBox.Show(
+                    this,
+                    message,
+                    "Evernote Export",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            else
+            {
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {message}");
+            }
+
+            return false;
+        }
+
+        try
+        {
+            var rootPath = GetConfiguredEvernoteRootPath();
+            if (string.IsNullOrWhiteSpace(rootPath))
+            {
+                if (showDialogs)
+                {
+                    MessageBox.Show(
+                        this,
+                        "Choisis d'abord le dossier racine Evernote.",
+                        "Evernote Export",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                }
+
+                return false;
+            }
+
+            var selectedNotebooks = GetSelectedNotebooksForExport();
+            if (selectedNotebooks.Count == 0)
+            {
+                if (showDialogs)
+                {
+                    MessageBox.Show(
+                        this,
+                        "Aucun notebook selectionne. Coche au moins un notebook ou une stack.",
+                        "Evernote Export",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                }
+
+                return false;
+            }
+
+            var normalizedTargetExportNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (targetExportFileNames is not null)
+            {
+                foreach (var target in targetExportFileNames)
+                {
+                    var normalized = SanitizeExportFileBaseName(target);
+                    if (!string.IsNullOrWhiteSpace(normalized))
+                    {
+                        normalizedTargetExportNames.Add(normalized);
+                    }
+                }
+            }
+
+            var groups = selectedNotebooks
+                .Where(notebook => normalizedTargetExportNames.Count == 0 ||
+                                   normalizedTargetExportNames.Contains(notebook.ExportFileBaseName))
+                .GroupBy(notebook => notebook.ExportFileBaseName, StringComparer.OrdinalIgnoreCase)
+                .Select(group => new EvernoteExportGroupWorkItem(
+                    group.Key,
+                    group.Select(notebook => notebook.NotebookId)
+                        .Where(id => !string.IsNullOrWhiteSpace(id))
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToArray()))
+                .Where(group => group.NotebookIds.Count > 0)
+                .ToList();
+
+            if (groups.Count == 0)
+            {
+                SetEvernoteStatus("Aucun groupe d'export cible.");
+                return false;
+            }
+
+            var exportRootDirectory = Path.Combine(Directory.GetCurrentDirectory(), AppConfig.EvernoteExportRootFolderName);
+            var exportBackupsDirectory = Path.Combine(exportRootDirectory, AppConfig.EvernoteExportBackupsFolderName);
+            Directory.CreateDirectory(exportRootDirectory);
+            Directory.CreateDirectory(exportBackupsDirectory);
+
+            var totalSteps = Math.Max(1, groups.Count);
+            BeginEvernoteExportProgress(totalSteps, source);
+
+            var maxBackupsToKeep = _appState.MaxMarkdownFilesToKeep;
+            IProgress<EvernoteExportProgressState> progress = new Progress<EvernoteExportProgressState>(state =>
+            {
+                SetEvernoteExportProgress(state.CompletedSteps, totalSteps, state.Message);
+            });
+
+            var completedSteps = 0;
+            var exportTasks = groups
+                .Select(group => Task.Run(() =>
+                {
+                    var result = EvernoteLocalDbService.ExportNotebookGroupToMarkdown(
+                        rootPath,
+                        group.NotebookIds,
+                        group.ExportFileBaseName,
+                        exportRootDirectory,
+                        exportBackupsDirectory,
+                        maxBackupsToKeep);
+
+                    var finished = Interlocked.Increment(ref completedSteps);
+                    progress.Report(new EvernoteExportProgressState(
+                        finished,
+                        $"Export termine ({finished}/{groups.Count}): {group.ExportFileBaseName}.md"));
+                    return result;
+                }))
+                .ToArray();
+
+            var groupResults = (await Task.WhenAll(exportTasks)).ToList();
+
+            if (groupResults.Count == 0)
+            {
+                SetEvernoteStatus("Aucun export genere.");
+                return false;
+            }
+
+            if (GoogleDriveConfigSyncService.IsConfigured(_appState))
+            {
+                var uploadItems = new List<EvernoteDriveFileUploadItem>();
+                foreach (var result in groupResults)
+                {
+                    uploadItems.Add(new EvernoteDriveFileUploadItem(
+                        result.OutputFilePath,
+                        IsBackup: false,
+                        ConvertToGoogleDoc: true));
+                    if (!string.IsNullOrWhiteSpace(result.BackupFilePath))
+                    {
+                        uploadItems.Add(new EvernoteDriveFileUploadItem(
+                            result.BackupFilePath,
+                            IsBackup: true,
+                            ConvertToGoogleDoc: false));
+                    }
+                }
+
+                if (uploadItems.Count > 0)
+                {
+                    SetEvernoteExportProgressIndeterminate("Sync Google Drive en cours...");
+                    var driveSyncResult = await GoogleDriveConfigSyncService.SyncEvernoteMarkdownFilesAsync(
+                        _appState,
+                        uploadItems,
+                        CancellationToken.None);
+
+                    if (!driveSyncResult.IsSuccess)
+                    {
+                        Console.WriteLine(
+                            $"[{DateTime.Now:HH:mm:ss}] Google Drive markdown sync failed: {driveSyncResult.Error}");
+                    }
+                    else
+                    {
+                        Console.WriteLine(
+                            $"[{DateTime.Now:HH:mm:ss}] Google Drive markdown sync ok: {driveSyncResult.UploadedFiles} file(s), {driveSyncResult.ConvertedGoogleDocs} Google Doc(s).");
+                    }
+                }
+            }
+
+            var totalNotes = groupResults.Sum(result => result.ExportedNotes);
+            var deletedBackups = groupResults.Sum(result => result.DeletedBackupFiles);
+            var exportedFiles = string.Join(
+                ", ",
+                groupResults.Select(result => Path.GetFileName(result.OutputFilePath)));
+            var cleanupInfo = deletedBackups > 0 ? $" | backups supprimes: {deletedBackups}" : string.Empty;
+            var status = $"Export termine ({source}): {groupResults.Count} fichiers, {totalNotes} notes -> {exportedFiles}{cleanupInfo}";
+            SetEvernoteStatus(status);
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {status}");
+
+            if (showDialogs)
+            {
+                var filesLine = string.Join(
+                    Environment.NewLine,
+                    groupResults.Select(result => $"- {Path.GetFileName(result.OutputFilePath)} ({result.ExportedNotes} notes)"));
+                var backupLine = deletedBackups > 0
+                    ? $"{Environment.NewLine}{Environment.NewLine}Backups supprimes: {deletedBackups}"
+                    : string.Empty;
+                MessageBox.Show(
+                    this,
+                    $"Export termine.{Environment.NewLine}{Environment.NewLine}Fichiers:{Environment.NewLine}{filesLine}{backupLine}",
+                    "Evernote Export",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+
+            return true;
+        }
+        catch (Exception exception)
+        {
+            SetEvernoteStatus($"Export echoue: {exception.Message}");
+            if (showDialogs)
+            {
+                MessageBox.Show(
+                    this,
+                    $"Export impossible.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
+                    "Evernote Export",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+
+            return false;
+        }
+        finally
+        {
+            EndEvernoteExportProgress();
+            _evernoteExportSemaphore.Release();
+        }
+    }
+
+    private void BeginEvernoteExportProgress(int totalSteps, string source)
+    {
+        _evernoteExportProgressBar.Style = ProgressBarStyle.Continuous;
+        _evernoteExportProgressBar.MarqueeAnimationSpeed = 0;
+        _evernoteExportProgressBar.Minimum = 0;
+        _evernoteExportProgressBar.Maximum = Math.Max(1, totalSteps);
+        _evernoteExportProgressBar.Value = 0;
+        _evernoteExportProgressBar.Visible = true;
+        SetEvernoteStatus($"Export {source} en cours...");
+    }
+
+    private void SetEvernoteExportProgress(int completedSteps, int totalSteps, string message)
+    {
+        var max = Math.Max(1, totalSteps);
+        if (_evernoteExportProgressBar.Style != ProgressBarStyle.Continuous)
+        {
+            _evernoteExportProgressBar.Style = ProgressBarStyle.Continuous;
+            _evernoteExportProgressBar.MarqueeAnimationSpeed = 0;
+        }
+
+        _evernoteExportProgressBar.Maximum = max;
+        var boundedValue = Math.Clamp(completedSteps, 0, max);
+        _evernoteExportProgressBar.Value = boundedValue;
+        if (!string.IsNullOrWhiteSpace(message))
+        {
+            SetEvernoteStatus(message);
+        }
+    }
+
+    private void SetEvernoteExportProgressIndeterminate(string message)
+    {
+        _evernoteExportProgressBar.Style = ProgressBarStyle.Marquee;
+        _evernoteExportProgressBar.MarqueeAnimationSpeed = 22;
+        if (!string.IsNullOrWhiteSpace(message))
+        {
+            SetEvernoteStatus(message);
+        }
+    }
+
+    private void EndEvernoteExportProgress()
+    {
+        _evernoteExportProgressBar.Style = ProgressBarStyle.Continuous;
+        _evernoteExportProgressBar.MarqueeAnimationSpeed = 0;
+        _evernoteExportProgressBar.Value = 0;
+        _evernoteExportProgressBar.Visible = false;
+    }
+
+    private List<SelectedEvernoteNotebookForExport> GetSelectedNotebooksForExport()
+    {
+        var notebooks = new List<SelectedEvernoteNotebookForExport>();
+        foreach (TreeNode stackNode in _evernoteTreeView.Nodes)
+        {
+            if (stackNode.Tag is not EvernoteTreeNodeTag stackTag || stackTag.Kind != EvernoteTreeNodeKind.Stack)
+            {
+                continue;
+            }
+
+            if (_appState.IsEvernoteStackIgnored(stackTag.Id))
+            {
+                continue;
+            }
+
+            foreach (TreeNode notebookNode in stackNode.Nodes)
+            {
+                if (!notebookNode.Checked ||
+                    notebookNode.Tag is not EvernoteTreeNodeTag notebookTag ||
+                    notebookTag.Kind != EvernoteTreeNodeKind.Notebook)
+                {
+                    continue;
+                }
+
+                if (_appState.IsEvernoteNotebookIgnored(notebookTag.Id))
+                {
+                    continue;
+                }
+
+                var exportFileBaseName = ResolveExportFileBaseName(stackTag, notebookTag);
+                notebooks.Add(new SelectedEvernoteNotebookForExport(
+                    notebookTag.Id,
+                    notebookTag.Name,
+                    stackTag.Id,
+                    stackTag.Name,
+                    exportFileBaseName));
+            }
+        }
+
+        return notebooks
+            .GroupBy(notebook => notebook.NotebookId, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToList();
+    }
+
+    private string ResolveExportFileBaseName(EvernoteTreeNodeTag stackTag, EvernoteTreeNodeTag notebookTag)
+    {
+        var notebookAssignment = _appState.GetEvernoteNotebookExportFileName(notebookTag.Id);
+        var stackAssignment = _appState.GetEvernoteStackExportFileName(stackTag.Id);
+        var fallback = stackTag.Name;
+
+        var resolved = notebookAssignment ?? stackAssignment ?? fallback;
+        var sanitized = SanitizeExportFileBaseName(resolved);
+        if (string.IsNullOrWhiteSpace(sanitized))
+        {
+            sanitized = "export_evernote";
+        }
+
+        return sanitized;
+    }
+
+    private void EvernoteTreeView_AfterCheck(object? sender, TreeViewEventArgs e)
+    {
+        var changedNode = e.Node;
+        if (_syncingEvernoteTreeChecks || changedNode is null || changedNode.Tag is not EvernoteTreeNodeTag tag)
+        {
+            return;
+        }
+
+        _syncingEvernoteTreeChecks = true;
+        try
+        {
+            if (tag.Kind == EvernoteTreeNodeKind.Stack)
+            {
+                var previousStackSelection = _appState.IsEvernoteStackSelected(tag.Id);
+                _appState.SetEvernoteStackSelection(tag.Id, changedNode.Checked);
+                if (previousStackSelection != changedNode.Checked)
+                {
+                    LogEvernoteSelection("Stack", tag.Name, tag.Id, changedNode.Checked);
+                }
+
+                foreach (TreeNode notebookNode in changedNode.Nodes)
+                {
+                    notebookNode.Checked = changedNode.Checked;
+                    ApplyNotebookSelectionFromNode(notebookNode);
+                }
+            }
+            else
+            {
+                ApplyNotebookSelectionFromNode(changedNode);
+                SyncStackSelectionFromChildren(changedNode.Parent);
+            }
+
+            QueueAppStateSave();
+        }
+        finally
+        {
+            _syncingEvernoteTreeChecks = false;
+        }
+    }
+
+    private void ApplyNotebookSelectionFromNode(TreeNode notebookNode)
+    {
+        if (notebookNode.Tag is not EvernoteTreeNodeTag notebookTag ||
+            notebookTag.Kind != EvernoteTreeNodeKind.Notebook)
+        {
+            return;
+        }
+
+        var previousNotebookSelection = _appState.IsEvernoteNotebookSelected(notebookTag.Id);
+        _appState.SetEvernoteNotebookSelection(notebookTag.Id, notebookNode.Checked);
+        if (previousNotebookSelection != notebookNode.Checked)
+        {
+            LogEvernoteSelection("Notebook", notebookTag.Name, notebookTag.Id, notebookNode.Checked);
+        }
+    }
+
+    private void SyncStackSelectionFromChildren(TreeNode? stackNode)
+    {
+        if (stackNode?.Tag is not EvernoteTreeNodeTag stackTag ||
+            stackTag.Kind != EvernoteTreeNodeKind.Stack)
+        {
+            return;
+        }
+
+        var shouldBeChecked = stackNode.Nodes.Cast<TreeNode>().Any(child => child.Checked);
+        var previousStackSelection = _appState.IsEvernoteStackSelected(stackTag.Id);
+
+        if (stackNode.Checked != shouldBeChecked)
+        {
+            stackNode.Checked = shouldBeChecked;
+        }
+
+        _appState.SetEvernoteStackSelection(stackTag.Id, shouldBeChecked);
+        if (previousStackSelection != shouldBeChecked)
+        {
+            LogEvernoteSelection("Stack", stackTag.Name, stackTag.Id, shouldBeChecked);
+        }
+    }
+
+    private static void LogEvernoteSelection(string type, string name, string id, bool isSelected)
+    {
+        var action = isSelected ? "selected" : "deselected";
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {type} {name} ({id}) {action}.");
+    }
+
+    private static void LogEvernoteIgnoreChange(string type, string name, string id, bool ignored)
+    {
+        var action = ignored ? "ignored" : "unignored";
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {type} {name} ({id}) {action}.");
+    }
+
+    private void TrayIcon_MouseClick(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left)
+        {
+            return;
+        }
+
+        ToggleWindowVisibilityFromTray();
+    }
+
+    private void ToggleWindowVisibilityFromTray()
+    {
+        if (Visible && WindowState != FormWindowState.Minimized)
+        {
+            HideToTray();
+            return;
+        }
+
+        RestoreFromTray();
+    }
+
+    private void UpdateTrayMenuItems()
+    {
+        _switchAppMenuItem.DropDownItems.Clear();
+        foreach (var app in Enum.GetValues<WrappedApp>())
+        {
+            if (app == _currentApp)
+            {
+                continue;
+            }
+
+            var targetApp = app;
+            _switchAppMenuItem.DropDownItems.Add(
+                AppConfig.GetAppDisplayName(targetApp),
+                null,
+                (_, _) => SwitchApp(targetApp, restoreFromTray: true));
+        }
+
+        _switchAppMenuItem.Enabled = _switchAppMenuItem.DropDownItems.Count > 0;
+    }
+
+    private void AppSwitcher_SelectedIndexChanged(object? sender, EventArgs e)
+    {
+        if (_appSwitcher.SelectedIndex < 0)
+        {
+            return;
+        }
+
+        var app = (WrappedApp)_appSwitcher.SelectedIndex;
+        if (!Enum.IsDefined(typeof(WrappedApp), app))
+        {
+            app = AppConfig.DefaultApp;
+        }
+
+        SwitchApp(app, false);
+    }
+
+    private void SwitchApp(WrappedApp app, bool restoreFromTray)
+    {
+        if (app == _currentApp)
+        {
+            if (restoreFromTray)
+            {
+                RestoreFromTray();
+            }
+
+            return;
+        }
+
+        _currentApp = app;
+
+        if (_appSwitcher.SelectedIndex != (int)_currentApp)
+        {
+            _appSwitcher.SelectedIndex = (int)_currentApp;
+        }
+
+        UpdateAppChrome();
+        _appState.LastSelectedApp = _currentApp;
+        QueueAppStateSave();
+        ShowActiveContent();
+
+        if (restoreFromTray)
+        {
+            RestoreFromTray();
+        }
+    }
+
+    private WebView2? GetCurrentWebView()
+    {
+        return _webViews.TryGetValue(_currentApp, out var webView)
+            ? webView
+            : null;
+    }
+
+    private void RefreshCurrentApp()
+    {
+        if (_currentApp == WrappedApp.EvernoteExport)
+        {
+            LoadEvernoteTreeFromConfiguredRoot(showErrors: true);
+            return;
+        }
+
+        GetCurrentWebView()?.CoreWebView2?.Reload();
+    }
+
+    private void EvernotePollingTimer_Tick(object? sender, EventArgs e)
+    {
+        LoadEvernoteTreeFromConfiguredRoot(showErrors: false, refreshTracking: false);
+        PollEvernoteTracking(allowAutoExport: true, showErrors: false, ignorePause: false);
+    }
+
+    private void ApplyEvernotePollingSettings()
+    {
+        var intervalMinutes = Math.Max(1, _appState.EvernotePollingIntervalMinutes);
+        _evernotePollingTimer.Interval = checked(intervalMinutes * 60 * 1000);
+
+        if (_appState.EvernotePollingPaused)
+        {
+            _evernotePollingTimer.Stop();
+            return;
+        }
+
+        if (!_evernotePollingTimer.Enabled)
+        {
+            _evernotePollingTimer.Start();
+        }
+    }
+
+    private void ResetEvernoteTrackingBaseline()
+    {
+        _appState.EvernoteSnapshotInitialized = false;
+        _appState.EvernoteStackNoteSnapshots = [];
+        _appState.EvernoteNotebookNoteSnapshots = [];
+        _lastEvernoteAutoExportUtc = DateTime.MinValue;
+    }
+
+    private void PollEvernoteTracking(bool allowAutoExport, bool showErrors, bool ignorePause)
+    {
+        if (_evernotePollingInProgress)
+        {
+            return;
+        }
+
+        if (!ignorePause && _appState.EvernotePollingPaused)
+        {
+            return;
+        }
+
+        var rootPath = GetConfiguredEvernoteRootPath();
+        if (string.IsNullOrWhiteSpace(rootPath))
+        {
+            return;
+        }
+
+        _evernotePollingInProgress = true;
+        try
+        {
+            var previousNotebookMap = _appState.GetEvernoteNotebookSnapshotMap();
+            var hasPreviousSnapshot = _appState.EvernoteSnapshotInitialized;
+
+            EvernoteTrackingSnapshot trackingSnapshot;
+            string dbPath;
+            try
+            {
+                trackingSnapshot = EvernoteLocalDbService.GetTrackingSnapshot(rootPath, out dbPath);
+            }
+            catch (Exception exception)
+            {
+                if (showErrors)
+                {
+                    MessageBox.Show(
+                        this,
+                        $"Polling Evernote impossible.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
+                        "Evernote Export",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                }
+
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Evernote polling failed: {exception.Message}");
+                return;
+            }
+
+            _appState.SetEvernoteTrackingSnapshot(trackingSnapshot.StackSnapshots, trackingSnapshot.NotebookSnapshots);
+            QueueAppStateSave();
+
+            if (!hasPreviousSnapshot || !allowAutoExport)
+            {
+                return;
+            }
+
+            var monitoredNotebooks = GetSelectedNotebooksForExport();
+            if (monitoredNotebooks.Count == 0)
+            {
+                return;
+            }
+
+            var monitoredNotebookIds = monitoredNotebooks
+                .Select(notebook => notebook.NotebookId)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            var currentNotebookMap = BuildNotebookSnapshotMap(trackingSnapshot.NotebookSnapshots);
+            var changeSummary = AnalyzeChangedNotes(monitoredNotebookIds, previousNotebookMap, currentNotebookMap);
+            if (changeSummary.NoteChangeCount >= 1)
+            {
+                var targetExportFileNames = monitoredNotebooks
+                    .Where(notebook => changeSummary.ChangedNotebookIds.Contains(notebook.NotebookId))
+                    .Select(notebook => notebook.ExportFileBaseName)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+                if (targetExportFileNames.Length == 0)
+                {
+                    return;
+                }
+
+                var cooldown = TimeSpan.FromSeconds(EvernoteAutoExportCooldownSeconds);
+                var nowUtc = DateTime.UtcNow;
+                if (_lastEvernoteAutoExportUtc != DateTime.MinValue)
+                {
+                    var elapsed = nowUtc - _lastEvernoteAutoExportUtc;
+                    if (elapsed < cooldown)
+                    {
+                        var remainingSeconds = Math.Max(1, (int)Math.Ceiling((cooldown - elapsed).TotalSeconds));
+                        SetEvernoteStatus(
+                            $"{changeSummary.NoteChangeCount} note change(s) detected in {dbPath}. Auto export cooldown active ({remainingSeconds}s remaining).");
+                        return;
+                    }
+                }
+
+                _lastEvernoteAutoExportUtc = nowUtc;
+                SetEvernoteStatus(
+                    $"{changeSummary.NoteChangeCount} note change(s) detected in {dbPath}. Auto export running for {string.Join(", ", targetExportFileNames)}...");
+                _ = ExportSelectedEvernoteContentToMarkdownAsync(
+                    showDialogs: false,
+                    source: "auto",
+                    targetExportFileNames: targetExportFileNames);
+            }
+        }
+        finally
+        {
+            _evernotePollingInProgress = false;
+        }
+    }
+
+    private static Dictionary<string, Dictionary<string, EvernoteNoteSnapshotState>> BuildNotebookSnapshotMap(
+        IEnumerable<EvernoteContainerNoteSnapshotState> containers)
+    {
+        var map = new Dictionary<string, Dictionary<string, EvernoteNoteSnapshotState>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var container in containers)
+        {
+            var notebookId = container.ContainerId ?? string.Empty;
+            if (!map.TryGetValue(notebookId, out var noteMap))
+            {
+                noteMap = new Dictionary<string, EvernoteNoteSnapshotState>(StringComparer.OrdinalIgnoreCase);
+                map[notebookId] = noteMap;
+            }
+
+            foreach (var note in container.Notes ?? [])
+            {
+                if (string.IsNullOrWhiteSpace(note.NoteId))
+                {
+                    continue;
+                }
+
+                noteMap[note.NoteId] = note;
+            }
+        }
+
+        return map;
+    }
+
+    private static EvernoteChangeSummary AnalyzeChangedNotes(
+        IReadOnlyCollection<string> monitoredNotebookIds,
+        Dictionary<string, Dictionary<string, EvernoteNoteSnapshotState>> previousMap,
+        Dictionary<string, Dictionary<string, EvernoteNoteSnapshotState>> currentMap)
+    {
+        var changeCount = 0;
+        var changedNotebookIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var notebookId in monitoredNotebookIds.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            previousMap.TryGetValue(notebookId, out var previousNotes);
+            currentMap.TryGetValue(notebookId, out var currentNotes);
+
+            previousNotes ??= new Dictionary<string, EvernoteNoteSnapshotState>(StringComparer.OrdinalIgnoreCase);
+            currentNotes ??= new Dictionary<string, EvernoteNoteSnapshotState>(StringComparer.OrdinalIgnoreCase);
+
+            var noteIds = new HashSet<string>(previousNotes.Keys, StringComparer.OrdinalIgnoreCase);
+            noteIds.UnionWith(currentNotes.Keys);
+
+            foreach (var noteId in noteIds)
+            {
+                var existedBefore = previousNotes.TryGetValue(noteId, out var oldNote);
+                var existsNow = currentNotes.TryGetValue(noteId, out var newNote);
+
+                if (!existedBefore || !existsNow)
+                {
+                    changeCount++;
+                    changedNotebookIds.Add(notebookId);
+                    continue;
+                }
+
+                if (oldNote?.CreatedMs != newNote?.CreatedMs || oldNote?.UpdatedMs != newNote?.UpdatedMs)
+                {
+                    changeCount++;
+                    changedNotebookIds.Add(notebookId);
+                }
+            }
+        }
+
+        return new EvernoteChangeSummary(changeCount, changedNotebookIds);
+    }
+
+    private void ShowActiveContent()
+    {
+        var showingEvernoteExport = _currentApp == WrappedApp.EvernoteExport;
+        _evernoteExportPanel.Visible = showingEvernoteExport;
+        if (showingEvernoteExport)
+        {
+            LoadEvernoteTreeFromConfiguredRoot(showErrors: false);
+            _evernoteExportPanel.BringToFront();
+        }
+
+        foreach (var entry in _webViews)
+        {
+            entry.Value.Visible = entry.Key == _currentApp;
+        }
+
+        var currentWebView = GetCurrentWebView();
+        currentWebView?.BringToFront();
+    }
+
+    private void UpdateAppChrome()
+    {
+        var appName = AppConfig.GetAppDisplayName(_currentApp);
+        Text = AppVersionProvider.FormatWindowTitle(appName);
+        _trayIcon.Text = appName;
+        UpdateTrayMenuItems();
+    }
+
+    private void MainForm_WindowPlacementChanged(object? sender, EventArgs e)
+    {
+        CaptureWindowPlacement();
+        QueueAppStateSave();
+    }
+
+    private void MainForm_Resize(object? sender, EventArgs e)
+    {
+        if (WindowState == FormWindowState.Minimized)
+        {
+            HideToTray();
+        }
+
+        CaptureWindowPlacement();
+        QueueAppStateSave();
+    }
+
+    private void CaptureWindowPlacement()
+    {
+        _appState.LastWindowState = WindowState switch
+        {
+            FormWindowState.Maximized => SavedWindowState.Maximized,
+            FormWindowState.Minimized => SavedWindowState.Minimized,
+            _ => SavedWindowState.Normal
+        };
+
+        var normalBounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+        if (normalBounds.Width <= 0 || normalBounds.Height <= 0)
+        {
+            return;
+        }
+
+        _appState.SetWindowBounds(normalBounds);
+    }
+
+    private void ApplySavedWindowPlacement()
+    {
+        if (_appState.TryGetWindowBounds(out var savedBounds) && IsUsableBounds(savedBounds))
+        {
+            StartPosition = FormStartPosition.Manual;
+            Bounds = savedBounds;
+        }
+
+        WindowState = _appState.LastWindowState switch
+        {
+            SavedWindowState.Maximized => FormWindowState.Maximized,
+            SavedWindowState.Minimized => FormWindowState.Minimized,
+            _ => FormWindowState.Normal
+        };
+    }
+
+    private static bool IsUsableBounds(Rectangle bounds)
+    {
+        if (bounds.Width < 400 || bounds.Height < 300)
+        {
+            return false;
+        }
+
+        foreach (var screen in Screen.AllScreens)
+        {
+            if (screen.WorkingArea.IntersectsWith(bounds))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void QueueAppStateSave()
+    {
+        _windowStateSaveTimer.Stop();
+        _windowStateSaveTimer.Start();
+    }
+
+    private void WindowStateSaveTimer_Tick(object? sender, EventArgs e)
+    {
+        _windowStateSaveTimer.Stop();
+        PersistAppStateLocally(queueGoogleDriveSync: true);
+    }
+
+    private void SaveAppStateNow(bool queueGoogleDriveSync = true)
+    {
+        _windowStateSaveTimer.Stop();
+        PersistAppStateLocally(queueGoogleDriveSync);
+    }
+
+    private void PersistAppStateLocally(bool queueGoogleDriveSync)
+    {
+        AppStateStore.Save(_appState);
+        if (queueGoogleDriveSync)
+        {
+            QueueGoogleDriveSync();
+        }
+    }
+
+    private void QueueGoogleDriveSync()
+    {
+        if (_suspendGoogleDriveSyncQueue || !GoogleDriveConfigSyncService.IsConfigured(_appState))
+        {
+            return;
+        }
+
+        _googleDriveSyncTimer.Stop();
+        _googleDriveSyncTimer.Start();
+    }
+
+    private async void GoogleDriveSyncTimer_Tick(object? sender, EventArgs e)
+    {
+        _googleDriveSyncTimer.Stop();
+        await SyncConfigToGoogleDriveAsync(showErrors: false);
+    }
+
+    private async Task SyncConfigToGoogleDriveAsync(bool showErrors)
+    {
+        if (_googleDriveSyncInProgress || !GoogleDriveConfigSyncService.IsConfigured(_appState))
+        {
+            return;
+        }
+
+        _googleDriveSyncInProgress = true;
+        try
+        {
+            var json = AppStateStore.Serialize(_appState);
+            var uploadResult = await GoogleDriveConfigSyncService.UploadConfigAsync(
+                _appState,
+                json,
+                CancellationToken.None);
+
+            if (!uploadResult.IsSuccess)
+            {
+                var error = uploadResult.Error ?? "Unknown Google Drive sync error.";
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive config sync failed: {error}");
+                if (showErrors)
+                {
+                    MessageBox.Show(
+                        this,
+                        $"Impossible de sauvegarder la configuration sur Google Drive.{Environment.NewLine}{Environment.NewLine}{error}",
+                        "Google Drive Sync",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                }
+
+                return;
+            }
+
+            var fileId = uploadResult.FileId;
+            if (!string.IsNullOrWhiteSpace(fileId) &&
+                !string.Equals(_appState.GoogleDriveConfigFileId, fileId, StringComparison.Ordinal))
+            {
+                _appState.GoogleDriveConfigFileId = fileId;
+                AppStateStore.Save(_appState);
+            }
+
+            var modifiedLabel = uploadResult.ModifiedTimeUtc?.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") ?? "n/a";
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive config synced (file: {fileId ?? "new"}, modified: {modifiedLabel}).");
+        }
+        finally
+        {
+            _googleDriveSyncInProgress = false;
+        }
+    }
+
+    private void TopBarVisibilityTimer_Tick(object? sender, EventArgs e)
+    {
+        UpdateTopBarVisibility();
+    }
+
+    private void UpdateTopBarVisibility()
+    {
+        if (!Visible || WindowState == FormWindowState.Minimized)
+        {
+            SetTopBarVisible(false);
+            return;
+        }
+
+        var cursorInClient = PointToClient(Cursor.Position);
+        var isInsideWindow = ClientRectangle.Contains(cursorInClient);
+        var nearTopEdge = isInsideWindow && cursorInClient.Y >= 0 && cursorInClient.Y <= TopRevealThresholdPixels;
+        var overTopBar = _topBar.Visible && _topBar.Bounds.Contains(cursorInClient);
+        var switcherDropdownOpen = _appSwitcher.ComboBox?.DroppedDown == true;
+
+        SetTopBarVisible(nearTopEdge || overTopBar || switcherDropdownOpen);
+    }
+
+    private void SetTopBarVisible(bool visible)
+    {
+        if (_topBar.Visible == visible)
+        {
+            return;
+        }
+
+        _topBar.Visible = visible;
+        if (visible)
+        {
+            _topBar.BringToFront();
+        }
+    }
+
+    private void OpenSettings()
+    {
+        using var settingsForm = new SettingsForm(
+            _appState.CloseButtonBehavior,
+            _appState.EvernotePollingIntervalMinutes,
+            _appState.EvernotePollingPaused,
+            _appState.MaxMarkdownFilesToKeep,
+            _appState.GoogleDriveSyncEnabled,
+            _appState.GoogleDriveAutoRestoreOnStartup,
+            _appState.GoogleDriveClientId,
+            _appState.GoogleDriveClientSecret,
+            _appState.GoogleDriveConfigFileId);
+        if (settingsForm.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        var stateChanged = false;
+
+        if (settingsForm.SelectedCloseButtonBehavior != _appState.CloseButtonBehavior)
+        {
+            _appState.CloseButtonBehavior = settingsForm.SelectedCloseButtonBehavior;
+            stateChanged = true;
+        }
+
+        if (settingsForm.SelectedEvernotePollingIntervalMinutes != _appState.EvernotePollingIntervalMinutes)
+        {
+            _appState.EvernotePollingIntervalMinutes = settingsForm.SelectedEvernotePollingIntervalMinutes;
+            stateChanged = true;
+        }
+
+        if (settingsForm.IsEvernotePollingPaused != _appState.EvernotePollingPaused)
+        {
+            _appState.EvernotePollingPaused = settingsForm.IsEvernotePollingPaused;
+            stateChanged = true;
+        }
+
+        if (settingsForm.SelectedMaxMarkdownFilesToKeep != _appState.MaxMarkdownFilesToKeep)
+        {
+            _appState.MaxMarkdownFilesToKeep = settingsForm.SelectedMaxMarkdownFilesToKeep;
+            stateChanged = true;
+        }
+
+        if (settingsForm.IsGoogleDriveSyncEnabled != _appState.GoogleDriveSyncEnabled)
+        {
+            _appState.GoogleDriveSyncEnabled = settingsForm.IsGoogleDriveSyncEnabled;
+            stateChanged = true;
+        }
+
+        if (settingsForm.IsGoogleDriveAutoRestoreOnStartup != _appState.GoogleDriveAutoRestoreOnStartup)
+        {
+            _appState.GoogleDriveAutoRestoreOnStartup = settingsForm.IsGoogleDriveAutoRestoreOnStartup;
+            stateChanged = true;
+        }
+
+        if (!string.Equals(settingsForm.GoogleDriveClientId, _appState.GoogleDriveClientId, StringComparison.Ordinal))
+        {
+            _appState.GoogleDriveClientId = settingsForm.GoogleDriveClientId;
+            stateChanged = true;
+        }
+
+        if (!string.Equals(settingsForm.GoogleDriveClientSecret, _appState.GoogleDriveClientSecret, StringComparison.Ordinal))
+        {
+            _appState.GoogleDriveClientSecret = settingsForm.GoogleDriveClientSecret;
+            stateChanged = true;
+        }
+
+        if (!string.Equals(settingsForm.GoogleDriveConfigFileId, _appState.GoogleDriveConfigFileId, StringComparison.Ordinal))
+        {
+            _appState.GoogleDriveConfigFileId = settingsForm.GoogleDriveConfigFileId;
+            stateChanged = true;
+        }
+
+        if (!stateChanged)
+        {
+            return;
+        }
+
+        ApplyEvernotePollingSettings();
+        SaveAppStateNow(queueGoogleDriveSync: false);
+        _ = SyncConfigToGoogleDriveAsync(showErrors: true);
+    }
+
+    private async Task LogoutAsync()
+    {
+        if (_logoutInProgress)
+        {
+            return;
+        }
+
+        if (MessageBox.Show(
+                this,
+                "This will sign you out of Google in this wrapper and clear saved session data. Continue?",
+                "Log out",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question) != DialogResult.Yes)
+        {
+            return;
+        }
+
+        _logoutInProgress = true;
+        UseWaitCursor = true;
+
+        try
+        {
+            await EnsureWebViewInitializedAsync(WrappedApp.Gemini);
+            await EnsureWebViewInitializedAsync(WrappedApp.NotebookLm);
+            await EnsureWebViewInitializedAsync(WrappedApp.GoogleDrive);
+
+            var webViews = _webViews.Values.ToArray();
+            foreach (var webView in webViews)
+            {
+                var core = webView.CoreWebView2;
+                if (core is null)
+                {
+                    continue;
+                }
+
+                core.CookieManager.DeleteAllCookies();
+                await core.Profile.ClearBrowsingDataAsync();
+            }
+
+            _appState.SetLastUrl(WrappedApp.Gemini, null);
+            _appState.SetLastUrl(WrappedApp.NotebookLm, null);
+            _appState.SetLastUrl(WrappedApp.GoogleDrive, null);
+            SaveAppStateNow();
+
+            foreach (var app in _webViews.Keys.ToArray())
+            {
+                var webView = _webViews[app];
+                webView.CoreWebView2?.Navigate(AppConfig.GetAppUrl(app));
+            }
+
+            SwitchApp(AppConfig.DefaultApp, restoreFromTray: false);
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show(
+                this,
+                $"Could not complete logout.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
+                "Log out failed",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
+        finally
+        {
+            UseWaitCursor = false;
+            _logoutInProgress = false;
+        }
+    }
+
+    private void MainForm_FormClosing(object? sender, FormClosingEventArgs e)
+    {
+        if (_exitRequested)
+        {
+            _trayIcon.Visible = false;
+            return;
+        }
+
+        if (e.CloseReason != CloseReason.UserClosing)
+        {
+            return;
+        }
+
+        if (_appState.CloseButtonBehavior == CloseButtonBehavior.CloseApp)
+        {
+            _exitRequested = true;
+            CaptureWindowPlacement();
+            SaveAppStateNow();
+            _trayIcon.Visible = false;
+            return;
+        }
+
+        e.Cancel = true;
+        HideToTray();
+    }
+
+    private void HideToTray()
+    {
+        Hide();
+
+        if (_balloonShown)
+        {
+            return;
+        }
+
+        _balloonShown = true;
+        var appName = AppConfig.GetAppDisplayName(_currentApp);
+        _trayIcon.ShowBalloonTip(
+            2000,
+            $"{appName} is still running",
+            "Use the tray icon to reopen or exit.",
+            ToolTipIcon.Info);
+    }
+
+    private void RestoreFromTray()
+    {
+        Show();
+        if (WindowState == FormWindowState.Minimized)
+        {
+            WindowState = FormWindowState.Normal;
+        }
+
+        Activate();
+        UpdateTopBarVisibility();
+    }
+
+    private void ExitApplication()
+    {
+        _exitRequested = true;
+        CaptureWindowPlacement();
+        SaveAppStateNow();
+        _trayIcon.Visible = false;
+        Close();
+    }
+
+    private sealed record SelectedEvernoteNotebookForExport(
+        string NotebookId,
+        string NotebookName,
+        string StackId,
+        string StackName,
+        string ExportFileBaseName);
+
+    private sealed record EvernoteExportGroupWorkItem(
+        string ExportFileBaseName,
+        IReadOnlyList<string> NotebookIds);
+
+    private sealed record EvernoteExportProgressState(
+        int CompletedSteps,
+        string Message);
+
+    private sealed record EvernoteChangeSummary(
+        int NoteChangeCount,
+        IReadOnlySet<string> ChangedNotebookIds);
+
+    private enum EvernoteTreeNodeKind
+    {
+        Stack,
+        Notebook
+    }
+
+    private sealed record EvernoteTreeNodeTag(
+        EvernoteTreeNodeKind Kind,
+        string Id,
+        string Name,
+        int ItemCount = 0,
+        long? LatestChangeMs = null);
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _googleDriveSyncTimer.Dispose();
+            _evernotePollingTimer.Dispose();
+            _topBarVisibilityTimer.Dispose();
+            _windowStateSaveTimer.Dispose();
+            _evernoteTreeNodeMenu.Dispose();
+            _trayIcon.Dispose();
+            _trayMenu.Dispose();
+            foreach (var webView in _webViews.Values)
+            {
+                webView.Dispose();
+            }
+        }
+
+        base.Dispose(disposing);
+    }
+}

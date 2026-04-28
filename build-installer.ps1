@@ -37,7 +37,7 @@ if (-not $Version) {
 
 $safeVersion = $Version -replace '[^0-9A-Za-z\.\-_]', '_'
 $installerFileName = "WinGeminiSetup-$safeVersion-$Runtime.exe"
-$installerOutputDir = $projectRoot
+$installerOutputDir = $installerDir
 $installerOutputPath = Join-Path $installerOutputDir $installerFileName
 $installerOutputBaseName = [System.IO.Path]::GetFileNameWithoutExtension($installerFileName)
 
