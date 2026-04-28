@@ -11,6 +11,7 @@ internal sealed class MainForm : Form
     private const int TopBarPollMs = 120;
     private const int GoogleDriveSyncDebounceMs = 1200;
     private const int PollingLockSyncIntervalMs = 6000;
+    private const int PollingStateWriteHeartbeatSeconds = 30;
     private const int EvernoteAutoExportCooldownSeconds = 30;
     private const int TraySyncAnimationIntervalMs = 90;
     private static readonly TimeSpan PollingLockOwnerStaleThreshold = TimeSpan.FromMinutes(2);
@@ -68,6 +69,8 @@ internal sealed class MainForm : Form
     private string? _pendingTakeoverRequestId;
     private string? _pendingTakeoverTargetInstanceId;
     private string? _pendingTakeoverTargetDisplayName;
+    private bool _pendingTakeoverObservedInDrive;
+    private DateTimeOffset? _pendingTakeoverRequestedAtUtc;
     private SettingsForm? _settingsFormOpenInstance;
     private bool _settingsPauseChangeInProgress;
     private bool _settingsForceLockInProgress;
@@ -75,6 +78,8 @@ internal sealed class MainForm : Form
     private int _pendingTakeoverMissingObservationCount;
     private readonly Dictionary<string, DateTimeOffset?> _pollingStateMetaSnapshot = new(StringComparer.OrdinalIgnoreCase);
     private List<GoogleDrivePollingStateFile> _cachedPollingStates = [];
+    private DateTimeOffset _lastLocalPollingStateWriteUtc = DateTimeOffset.MinValue;
+    private string? _lastLocalPollingStateSignature;
 
     internal MainForm()
     {
@@ -1862,6 +1867,8 @@ internal sealed class MainForm : Form
                     _pendingTakeoverRequestId = existingLocalState.Document.PendingTakeoverRequest.RequestId;
                     _pendingTakeoverTargetInstanceId = existingLocalState.Document.PendingTakeoverRequest.RequestedToInstanceId;
                     _pendingTakeoverTargetDisplayName = existingLocalState.Document.PendingTakeoverRequest.RequestedToDisplayName;
+                    _pendingTakeoverObservedInDrive = true;
+                    _pendingTakeoverRequestedAtUtc = existingLocalState.Document.PendingTakeoverRequest.RequestedAtUtc;
                 }
 
                 // If remote already reflects an approved takeover, avoid re-writing an old pending request locally.
@@ -1873,9 +1880,13 @@ internal sealed class MainForm : Form
                     _pendingTakeoverRequestId = null;
                     _pendingTakeoverTargetInstanceId = null;
                     _pendingTakeoverTargetDisplayName = null;
+                    _pendingTakeoverRequestedAtUtc = null;
                     _pendingTakeoverMissingObservationCount = 0;
                     LogPollingLock("Remote state indicates takeover already approved; adopting active local state before upsert.");
                 }
+
+                _lastLocalPollingStateWriteUtc = existingLocalState.Document.UpdatedAtUtc;
+                _lastLocalPollingStateSignature = BuildLocalPollingStateSignature(existingLocalState.Document);
             }
             else
             {
@@ -1883,36 +1894,45 @@ internal sealed class MainForm : Form
             }
 
             var localDocument = BuildLocalPollingStateDocument();
-            LogPollingLock($"Upserting local state '{_localMachineStateFileName}' (fileId={_localMachineStateFileId ?? "new"}): paused={localDocument.PauseAutomaticPolling}, pending={DescribePending(localDocument.PendingTakeoverRequest)}.");
-            var upsertResult = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
-                _appState,
-                _localMachineStateFileName,
-                localDocument,
-                _localMachineStateFileId,
-                CancellationToken.None);
-
-            if (!upsertResult.IsSuccess)
+            if (ShouldUpsertLocalPollingState(localDocument))
             {
-                LogPollingLock($"Local state upsert failed: {upsertResult.Error ?? "unknown error"}");
-                if (showErrors && !string.IsNullOrWhiteSpace(upsertResult.Error))
+                LogPollingLock($"Upserting local state '{_localMachineStateFileName}' (fileId={_localMachineStateFileId ?? "new"}): paused={localDocument.PauseAutomaticPolling}, pending={DescribePending(localDocument.PendingTakeoverRequest)}.");
+                var upsertResult = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+                    _appState,
+                    _localMachineStateFileName,
+                    localDocument,
+                    _localMachineStateFileId,
+                    CancellationToken.None);
+
+                if (!upsertResult.IsSuccess)
                 {
-                    MessageBox.Show(
-                        this,
-                        $"Impossible de mettre a jour le state local de synchronisation.{Environment.NewLine}{Environment.NewLine}{upsertResult.Error}",
-                        "Distributed Polling Lock",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Error);
+                    LogPollingLock($"Local state upsert failed: {upsertResult.Error ?? "unknown error"}");
+                    if (showErrors && !string.IsNullOrWhiteSpace(upsertResult.Error))
+                    {
+                        MessageBox.Show(
+                            this,
+                            $"Impossible de mettre a jour le state local de synchronisation.{Environment.NewLine}{Environment.NewLine}{upsertResult.Error}",
+                            "Distributed Polling Lock",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Error);
+                    }
+
+                    return;
                 }
 
-                return;
+                if (!string.IsNullOrWhiteSpace(upsertResult.FileId))
+                {
+                    _localMachineStateFileId = upsertResult.FileId;
+                }
+                _lastLocalPollingStateWriteUtc = DateTimeOffset.UtcNow;
+                _lastLocalPollingStateSignature = BuildLocalPollingStateSignature(localDocument);
+                LogPollingLock($"Local state upsert ok (fileId={_localMachineStateFileId ?? "n/a"}).");
+                UpdateCachedLocalPollingState(localDocument);
             }
-
-            if (!string.IsNullOrWhiteSpace(upsertResult.FileId))
+            else
             {
-                _localMachineStateFileId = upsertResult.FileId;
+                LogPollingLock("Local state upsert skipped (no relevant change, heartbeat not due).");
             }
-            LogPollingLock($"Local state upsert ok (fileId={_localMachineStateFileId ?? "n/a"}).");
-            UpdateCachedLocalPollingState(localDocument);
 
             metaListResult = await GoogleDriveConfigSyncService.ListPollingStateMetasAsync(_appState, CancellationToken.None);
             if (!metaListResult.IsSuccess)
@@ -2002,6 +2022,7 @@ internal sealed class MainForm : Form
             _pendingTakeoverRequestId = localState.Document.PendingTakeoverRequest.RequestId;
             _pendingTakeoverTargetInstanceId = localState.Document.PendingTakeoverRequest.RequestedToInstanceId;
             _pendingTakeoverTargetDisplayName = localState.Document.PendingTakeoverRequest.RequestedToDisplayName;
+            _pendingTakeoverObservedInDrive = true;
             _pendingTakeoverMissingObservationCount = 0;
             LogPollingLock($"Local pending request confirmed in Drive: {DescribePending(localState.Document.PendingTakeoverRequest)}.");
             return;
@@ -2009,30 +2030,52 @@ internal sealed class MainForm : Form
 
         if (string.IsNullOrWhiteSpace(_pendingTakeoverRequestId))
         {
+            _pendingTakeoverObservedInDrive = false;
             _pendingTakeoverMissingObservationCount = 0;
             _pendingTakeoverTargetInstanceId = null;
             _pendingTakeoverTargetDisplayName = null;
+            _pendingTakeoverRequestedAtUtc = null;
             return;
         }
 
         if (localState is not null && !localState.Document.PauseAutomaticPolling)
         {
             // Request accepted: requester is now active.
+            _pendingTakeoverObservedInDrive = false;
             _pendingTakeoverMissingObservationCount = 0;
             _pendingTakeoverRequestId = null;
             _pendingTakeoverTargetInstanceId = null;
             _pendingTakeoverTargetDisplayName = null;
+            _pendingTakeoverRequestedAtUtc = null;
             LogPollingLock("Local pending request cleared: requester became active.");
+            return;
+        }
+
+        if (localState is not null &&
+            localState.Document.PauseAutomaticPolling &&
+            localState.Document.PendingTakeoverRequest is null &&
+            _pendingTakeoverObservedInDrive)
+        {
+            // Request was observed previously then disappeared while requester stays paused -> treat as rejection.
+            _pendingTakeoverObservedInDrive = false;
+            _pendingTakeoverMissingObservationCount = 0;
+            _pendingTakeoverRequestId = null;
+            _pendingTakeoverTargetInstanceId = null;
+            _pendingTakeoverTargetDisplayName = null;
+            _pendingTakeoverRequestedAtUtc = null;
+            LogPollingLock("Local pending request cleared: requester stayed paused and pending disappeared (rejected).");
             return;
         }
 
         var localOwnsLock = string.Equals(owner?.Document.InstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase);
         if (localOwnsLock)
         {
+            _pendingTakeoverObservedInDrive = false;
             _pendingTakeoverMissingObservationCount = 0;
             _pendingTakeoverRequestId = null;
             _pendingTakeoverTargetInstanceId = null;
             _pendingTakeoverTargetDisplayName = null;
+            _pendingTakeoverRequestedAtUtc = null;
             LogPollingLock("Local pending request cleared: local instance owns lock.");
             return;
         }
@@ -2046,9 +2089,11 @@ internal sealed class MainForm : Form
         }
 
         _pendingTakeoverMissingObservationCount = 0;
+        _pendingTakeoverObservedInDrive = false;
         _pendingTakeoverRequestId = null;
         _pendingTakeoverTargetInstanceId = null;
         _pendingTakeoverTargetDisplayName = null;
+        _pendingTakeoverRequestedAtUtc = null;
         LogPollingLock("Local pending request cleared after repeated missing observations.");
     }
 
@@ -2145,6 +2190,37 @@ internal sealed class MainForm : Form
         {
             _cachedPollingStates.Add(localStateCopy);
         }
+    }
+
+    private bool ShouldUpsertLocalPollingState(GoogleDrivePollingStateDocument localDocument)
+    {
+        if (string.IsNullOrWhiteSpace(_localMachineStateFileId))
+        {
+            return true;
+        }
+
+        var signature = BuildLocalPollingStateSignature(localDocument);
+        if (!string.Equals(signature, _lastLocalPollingStateSignature, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        var heartbeatDueAt = _lastLocalPollingStateWriteUtc.AddSeconds(PollingStateWriteHeartbeatSeconds);
+        return DateTimeOffset.UtcNow >= heartbeatDueAt;
+    }
+
+    private static string BuildLocalPollingStateSignature(GoogleDrivePollingStateDocument document)
+    {
+        var pending = document.PendingTakeoverRequest;
+        return string.Join("|",
+            document.InstanceId,
+            document.HostName,
+            document.DisplayName,
+            document.PauseAutomaticPolling,
+            pending?.RequestId ?? string.Empty,
+            pending?.RequestedToInstanceId ?? string.Empty,
+            pending?.RequestedToDisplayName ?? string.Empty,
+            pending?.IsActive ?? false);
     }
 
     private async Task<bool> TryHandleIncomingTakeoverRequestAsync(IReadOnlyCollection<GoogleDrivePollingStateFile> states)
@@ -2337,6 +2413,8 @@ internal sealed class MainForm : Form
             return null;
         }
 
+        _pendingTakeoverRequestedAtUtc ??= DateTimeOffset.UtcNow;
+
         return new GoogleDrivePollingTakeoverRequest
         {
             RequestId = _pendingTakeoverRequestId,
@@ -2344,7 +2422,7 @@ internal sealed class MainForm : Form
             RequestedByDisplayName = GetLocalDisplayName(),
             RequestedToInstanceId = _pendingTakeoverTargetInstanceId,
             RequestedToDisplayName = _pendingTakeoverTargetDisplayName,
-            RequestedAtUtc = DateTimeOffset.UtcNow,
+            RequestedAtUtc = _pendingTakeoverRequestedAtUtc.Value,
             IsActive = true
         };
     }
@@ -2457,6 +2535,8 @@ internal sealed class MainForm : Form
                 _pendingTakeoverRequestId = null;
                 _pendingTakeoverTargetInstanceId = null;
                 _pendingTakeoverTargetDisplayName = null;
+                _pendingTakeoverRequestedAtUtc = null;
+                _pendingTakeoverObservedInDrive = false;
                 _pendingTakeoverMissingObservationCount = 0;
             }
             else
@@ -2471,6 +2551,8 @@ internal sealed class MainForm : Form
                     _pendingTakeoverRequestId = null;
                     _pendingTakeoverTargetInstanceId = null;
                     _pendingTakeoverTargetDisplayName = null;
+                    _pendingTakeoverRequestedAtUtc = null;
+                    _pendingTakeoverObservedInDrive = false;
                     _pendingTakeoverMissingObservationCount = 0;
                 }
                 else
@@ -2479,6 +2561,8 @@ internal sealed class MainForm : Form
                     _pendingTakeoverRequestId = Guid.NewGuid().ToString("N");
                     _pendingTakeoverTargetInstanceId = _lockOwnerInstanceId;
                     _pendingTakeoverTargetDisplayName = _lockOwnerDisplayName;
+                    _pendingTakeoverRequestedAtUtc = DateTimeOffset.UtcNow;
+                    _pendingTakeoverObservedInDrive = false;
                     _pendingTakeoverMissingObservationCount = 0;
                     LogPollingLock($"Resume requires takeover request: {DescribePendingLocalRequest()}.");
                 }
@@ -2523,6 +2607,8 @@ internal sealed class MainForm : Form
                 _pendingTakeoverRequestId = null;
                 _pendingTakeoverTargetInstanceId = null;
                 _pendingTakeoverTargetDisplayName = null;
+                _pendingTakeoverRequestedAtUtc = null;
+                _pendingTakeoverObservedInDrive = false;
                 _pendingTakeoverMissingObservationCount = 0;
                 _appState.EvernotePollingPaused = false;
                 ApplyEvernotePollingSettings();
@@ -2553,6 +2639,8 @@ internal sealed class MainForm : Form
             _pendingTakeoverRequestId = null;
             _pendingTakeoverTargetInstanceId = null;
             _pendingTakeoverTargetDisplayName = null;
+            _pendingTakeoverRequestedAtUtc = null;
+            _pendingTakeoverObservedInDrive = false;
             _pendingTakeoverMissingObservationCount = 0;
             _appState.EvernotePollingPaused = false;
             ApplyEvernotePollingSettings();
