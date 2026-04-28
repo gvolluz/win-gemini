@@ -34,6 +34,7 @@ internal sealed class MainForm : Form
     private readonly System.Windows.Forms.Timer _evernotePollingTimer;
     private readonly System.Windows.Forms.Timer _googleDriveSyncTimer;
     private readonly System.Windows.Forms.Timer _pollingLockSyncTimer;
+    private readonly System.Windows.Forms.Timer _settingsUiRefreshTimer;
     private readonly System.Windows.Forms.Timer _traySyncAnimationTimer;
     private CoreWebView2Environment? _webViewEnvironment;
     private AppState _appState;
@@ -68,6 +69,8 @@ internal sealed class MainForm : Form
     private string? _pendingTakeoverTargetInstanceId;
     private string? _pendingTakeoverTargetDisplayName;
     private SettingsForm? _settingsFormOpenInstance;
+    private bool _settingsPauseChangeInProgress;
+    private DateTimeOffset _nextPollingStateSyncAtUtc;
 
     internal MainForm()
     {
@@ -147,6 +150,13 @@ internal sealed class MainForm : Form
             Interval = PollingLockSyncIntervalMs
         };
         _pollingLockSyncTimer.Tick += PollingLockSyncTimer_Tick;
+        _nextPollingStateSyncAtUtc = DateTimeOffset.UtcNow.AddMilliseconds(_pollingLockSyncTimer.Interval);
+
+        _settingsUiRefreshTimer = new System.Windows.Forms.Timer
+        {
+            Interval = 1000
+        };
+        _settingsUiRefreshTimer.Tick += (_, _) => UpdateSettingsLockStatus();
 
         _traySyncAnimationTimer = new System.Windows.Forms.Timer
         {
@@ -221,6 +231,7 @@ internal sealed class MainForm : Form
         QueueAppStateSave();
         _topBarVisibilityTimer.Start();
         _pollingLockSyncTimer.Start();
+        _settingsUiRefreshTimer.Start();
         ApplyEvernotePollingSettings();
         LoadEvernoteTreeFromConfiguredRoot(showErrors: false);
         UpdateTopBarVisibility();
@@ -1763,6 +1774,8 @@ internal sealed class MainForm : Form
 
     private async void PollingLockSyncTimer_Tick(object? sender, EventArgs e)
     {
+        _nextPollingStateSyncAtUtc = DateTimeOffset.UtcNow.AddMilliseconds(_pollingLockSyncTimer.Interval);
+        UpdateSettingsLockStatus();
         await SyncDistributedPollingStateAsync(showErrors: false, processIncomingRequests: true);
     }
 
@@ -1931,6 +1944,7 @@ internal sealed class MainForm : Form
         }
         finally
         {
+            _nextPollingStateSyncAtUtc = DateTimeOffset.UtcNow.AddMilliseconds(_pollingLockSyncTimer.Interval);
             _distributedPollingSyncInProgress = false;
             UpdateSettingsLockStatus();
         }
@@ -2143,6 +2157,64 @@ internal sealed class MainForm : Form
         var isLocalOwner = string.Equals(_lockOwnerInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase);
         _settingsFormOpenInstance.UpdatePollingLockStatus(owner, isLocalOwner);
         _settingsFormOpenInstance.UpdatePendingPollingRequest(_pendingTakeoverTargetDisplayName);
+        var displayedPauseState = !string.IsNullOrWhiteSpace(_pendingTakeoverTargetDisplayName)
+            ? false
+            : _appState.EvernotePollingPaused;
+        _settingsFormOpenInstance.SetPausePollingCheckedSilently(displayedPauseState);
+        var intervalSeconds = Math.Max(1, _pollingLockSyncTimer.Interval / 1000);
+        var secondsUntilNextPoll = (int)Math.Ceiling((_nextPollingStateSyncAtUtc - DateTimeOffset.UtcNow).TotalSeconds);
+        _settingsFormOpenInstance.UpdateNextStatePollInfo(intervalSeconds, secondsUntilNextPoll);
+    }
+
+    private async Task HandlePausePollingToggleFromSettingsAsync(bool isPaused)
+    {
+        if (_settingsPauseChangeInProgress)
+        {
+            return;
+        }
+
+        _settingsPauseChangeInProgress = true;
+        try
+        {
+            await SyncDistributedPollingStateAsync(showErrors: false, processIncomingRequests: false);
+
+            if (isPaused)
+            {
+                _appState.EvernotePollingPaused = true;
+                _pendingTakeoverRequestId = null;
+                _pendingTakeoverTargetInstanceId = null;
+                _pendingTakeoverTargetDisplayName = null;
+            }
+            else
+            {
+                var localOwnsLock = string.Equals(_lockOwnerInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase);
+                var noCurrentOwner = string.IsNullOrWhiteSpace(_lockOwnerInstanceId);
+                if (localOwnsLock || noCurrentOwner)
+                {
+                    _appState.EvernotePollingPaused = false;
+                    _pendingTakeoverRequestId = null;
+                    _pendingTakeoverTargetInstanceId = null;
+                    _pendingTakeoverTargetDisplayName = null;
+                }
+                else
+                {
+                    _appState.EvernotePollingPaused = true;
+                    _pendingTakeoverRequestId = Guid.NewGuid().ToString("N");
+                    _pendingTakeoverTargetInstanceId = _lockOwnerInstanceId;
+                    _pendingTakeoverTargetDisplayName = _lockOwnerDisplayName;
+                }
+            }
+
+            ApplyEvernotePollingSettings();
+            SaveAppStateNow(queueGoogleDriveSync: false);
+            await SyncDistributedPollingStateAsync(showErrors: true, processIncomingRequests: false);
+            _ = SyncConfigToGoogleDriveAsync(showErrors: false);
+        }
+        finally
+        {
+            _settingsPauseChangeInProgress = false;
+            UpdateSettingsLockStatus();
+        }
     }
 
     private void ResetEvernoteTrackingBaseline()
@@ -2627,8 +2699,6 @@ internal sealed class MainForm : Form
 
     private async void OpenSettings()
     {
-        var pausedBeforeDialog = _appState.EvernotePollingPaused;
-        var settingsImported = false;
         using var settingsForm = new SettingsForm(
             _appState.CloseButtonBehavior,
             _appState.EvernotePollingIntervalMinutes,
@@ -2642,7 +2712,7 @@ internal sealed class MainForm : Form
         _settingsFormOpenInstance = settingsForm;
         UpdateSettingsLockStatus();
         await SyncDistributedPollingStateAsync(showErrors: false, processIncomingRequests: false);
-        settingsForm.EvernotePollingPausedChanged += isPaused => RefreshTrayPollingIconState(isPaused);
+        settingsForm.EvernotePollingPausedChanged += async isPaused => await HandlePausePollingToggleFromSettingsAsync(isPaused);
         settingsForm.ExportSettingsRequested += () => ExportSettingsWithDialog(settingsForm);
         settingsForm.ImportSettingsRequested += () =>
         {
@@ -2651,23 +2721,16 @@ internal sealed class MainForm : Form
                 return;
             }
 
-            settingsImported = true;
             settingsForm.DialogResult = DialogResult.Cancel;
             settingsForm.Close();
         };
         if (settingsForm.ShowDialog(this) != DialogResult.OK)
         {
-            if (!settingsImported)
-            {
-                RefreshTrayPollingIconState(pausedBeforeDialog);
-            }
-
             _settingsFormOpenInstance = null;
             return;
         }
 
         var stateChanged = false;
-        var requestedUnpauseWithoutLock = false;
 
         if (settingsForm.SelectedCloseButtonBehavior != _appState.CloseButtonBehavior)
         {
@@ -2679,34 +2742,6 @@ internal sealed class MainForm : Form
         {
             _appState.EvernotePollingIntervalMinutes = settingsForm.SelectedEvernotePollingIntervalMinutes;
             stateChanged = true;
-        }
-
-        if (settingsForm.IsEvernotePollingPaused != _appState.EvernotePollingPaused)
-        {
-            var wantsPollingActive = !settingsForm.IsEvernotePollingPaused;
-            var localOwnsLock = string.Equals(_lockOwnerInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase);
-            var noCurrentOwner = string.IsNullOrWhiteSpace(_lockOwnerInstanceId);
-            if (wantsPollingActive && !localOwnsLock && !noCurrentOwner)
-            {
-                requestedUnpauseWithoutLock = true;
-                _appState.EvernotePollingPaused = true;
-                _pendingTakeoverRequestId = Guid.NewGuid().ToString("N");
-                _pendingTakeoverTargetInstanceId = _lockOwnerInstanceId;
-                _pendingTakeoverTargetDisplayName = _lockOwnerDisplayName;
-                stateChanged = true;
-            }
-            else
-            {
-                _appState.EvernotePollingPaused = settingsForm.IsEvernotePollingPaused;
-                if (_appState.EvernotePollingPaused)
-                {
-                    _pendingTakeoverRequestId = null;
-                    _pendingTakeoverTargetInstanceId = null;
-                    _pendingTakeoverTargetDisplayName = null;
-                }
-
-                stateChanged = true;
-            }
         }
 
         if (settingsForm.SelectedMaxMarkdownFilesToKeep != _appState.MaxMarkdownFilesToKeep)
@@ -2757,16 +2792,6 @@ internal sealed class MainForm : Form
         await SyncDistributedPollingStateAsync(showErrors: true, processIncomingRequests: false);
         _ = SyncConfigToGoogleDriveAsync(showErrors: true);
         _settingsFormOpenInstance = null;
-
-        if (requestedUnpauseWithoutLock && !string.IsNullOrWhiteSpace(_pendingTakeoverTargetDisplayName))
-        {
-            MessageBox.Show(
-                this,
-                $"en attente de confirmation sur {_pendingTakeoverTargetDisplayName}",
-                "Demande en attente",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
-        }
     }
 
     private void ExportSettingsWithDialog(IWin32Window owner)
@@ -3076,6 +3101,7 @@ internal sealed class MainForm : Form
         if (disposing)
         {
             _traySyncAnimationTimer.Dispose();
+            _settingsUiRefreshTimer.Dispose();
             _pollingLockSyncTimer.Dispose();
             _googleDriveSyncTimer.Dispose();
             _evernotePollingTimer.Dispose();
