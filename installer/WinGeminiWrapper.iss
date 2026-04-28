@@ -136,18 +136,14 @@ begin
   PrereqConsentAsked := True;
 
   messageText :=
-    'This installation requires missing components and can download them now.' + #13#10 + #13#10 +
+    'Some required components appear to be missing and can be downloaded now.' + #13#10 + #13#10 +
     '- .NET Windows Desktop Runtime {#RequiredDotNetRuntimePrefix}.x (if missing)' + #13#10 +
     '- Microsoft Edge WebView2 Runtime (if missing)' + #13#10 + #13#10 +
-    'Do you want to download and install the missing components now?';
+    'Do you want to download and install these components now?' + #13#10 +
+    'You can continue without downloading if they are already installed.';
 
   PrereqConsentGranted := MsgBox(messageText, mbConfirmation, MB_YESNO) = IDYES;
-  if not PrereqConsentGranted then
-  begin
-    MsgBox('Installation canceled because required components were declined.', mbError, MB_OK);
-  end;
-
-  Result := PrereqConsentGranted;
+  Result := True;
 end;
 
 function InitializeSetup(): Boolean;
@@ -161,11 +157,8 @@ end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
+  EnsurePrerequisiteConsent();
   Result := '';
-  if not EnsurePrerequisiteConsent() then
-  begin
-    Result := 'Installation canceled because required components were declined.';
-  end;
 end;
 
 function ShouldInstallDotNetRuntime: Boolean;

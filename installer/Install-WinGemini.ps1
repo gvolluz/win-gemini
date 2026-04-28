@@ -64,20 +64,20 @@ $missingWebView2 = -not (Test-WebView2Runtime)
 
 if ($missingDotNet -or $missingWebView2) {
     Write-Host ""
-    Write-Host "Required components are missing and need to be downloaded:" -ForegroundColor Yellow
+    Write-Host "Some components appear to be missing and can be downloaded now:" -ForegroundColor Yellow
     if ($missingDotNet) { Write-Host "- .NET Windows Desktop Runtime 8.x" -ForegroundColor Yellow }
     if ($missingWebView2) { Write-Host "- Microsoft Edge WebView2 Runtime" -ForegroundColor Yellow }
-    $answer = Read-Host "Download and install missing components now? (y/n)"
-    if ($answer -notin @("y", "Y", "yes", "YES")) {
-        throw "Installation canceled because required components were declined."
-    }
+    $answer = Read-Host "Download and install these components now? (y/n)"
+    if ($answer -in @("y", "Y", "yes", "YES")) {
+        if ($missingDotNet) {
+            Install-FromUrl -Url $dotNetRuntimeUrl -OutFileName "windowsdesktop-runtime-installer.exe" -Arguments "/install /quiet /norestart"
+        }
 
-    if ($missingDotNet) {
-        Install-FromUrl -Url $dotNetRuntimeUrl -OutFileName "windowsdesktop-runtime-installer.exe" -Arguments "/install /quiet /norestart"
-    }
-
-    if ($missingWebView2) {
-        Install-FromUrl -Url $webView2BootstrapperUrl -OutFileName "MicrosoftEdgeWebView2Setup.exe" -Arguments "/silent /install"
+        if ($missingWebView2) {
+            Install-FromUrl -Url $webView2BootstrapperUrl -OutFileName "MicrosoftEdgeWebView2Setup.exe" -Arguments "/silent /install"
+        }
+    } else {
+        Write-Host "Continuing without downloading prerequisites. Setup may fail at runtime if components are truly missing." -ForegroundColor Yellow
     }
 }
 
