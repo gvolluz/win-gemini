@@ -83,7 +83,7 @@ internal sealed class MainForm : Form
 
     internal MainForm()
     {
-        AppLogger.Info("MainForm constructor started.");
+        AppLogger.Debug("MainForm constructor started.");
         _localMachineHostName = NormalizeHostName(Environment.MachineName);
         _localMachineInstanceSuffix = BuildStableInstanceSuffix();
         _localMachineInstanceId = $"{_localMachineHostName}:{_localMachineInstanceSuffix}";
@@ -92,6 +92,7 @@ internal sealed class MainForm : Form
         _localMachineStateFileName = _localMachineDefaultStateFileName;
         _appState = AppStateStore.Load();
         _appState.Normalize();
+        AppLogger.SetDebugLoggingEnabled(_appState.EnableDebugLogs);
         // Do not trust local PauseAutomaticPolling at startup; Drive state is source of truth.
         _appState.EvernotePollingPaused = true;
         _currentApp = Enum.IsDefined(typeof(WrappedApp), _appState.LastSelectedApp)
@@ -132,7 +133,7 @@ internal sealed class MainForm : Form
             ContextMenuStrip = _trayMenu,
             Visible = true
         };
-        AppLogger.Info("Tray icon initialized.");
+        AppLogger.Debug("Tray icon initialized.");
         _trayIcon.MouseClick += TrayIcon_MouseClick;
 
         _windowStateSaveTimer = new System.Windows.Forms.Timer
@@ -174,14 +175,14 @@ internal sealed class MainForm : Form
             Interval = TraySyncAnimationIntervalMs
         };
         _traySyncAnimationTimer.Tick += TraySyncAnimationTimer_Tick;
-        AppLogger.Info("Tray animation timer initialized.");
+        AppLogger.Debug("Tray animation timer initialized.");
 
-        AppLogger.Info("Applying Evernote polling settings.");
+        AppLogger.Debug("Applying Evernote polling settings.");
         ApplyEvernotePollingSettings();
 
         UpdateAppChrome();
         RefreshTrayPollingIconState();
-        AppLogger.Info("MainForm constructor completed.");
+        AppLogger.Debug("MainForm constructor completed.");
 
         Load += MainForm_Load;
         Shown += MainForm_Shown;
@@ -256,7 +257,7 @@ internal sealed class MainForm : Form
         if (!GoogleDriveConfigSyncService.IsConfigured(_appState) &&
             TryAttachGoogleDriveCredentialsFromDefaultFile(out var loadedPath))
         {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive OAuth client loaded from: {loadedPath}");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Google Drive OAuth client loaded from: {loadedPath}");
             if (!hasLocalConfigFile)
             {
                 _appState.GoogleDriveSyncEnabled = true;
@@ -275,20 +276,20 @@ internal sealed class MainForm : Form
         var downloadResult = await GoogleDriveConfigSyncService.DownloadConfigAsync(_appState, CancellationToken.None);
         if (downloadResult.IsNotFound)
         {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive config auto-restore: no remote config found.");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Google Drive config auto-restore: no remote config found.");
             return;
         }
 
         if (!downloadResult.IsSuccess)
         {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive config auto-restore failed: {downloadResult.Error}");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Google Drive config auto-restore failed: {downloadResult.Error}");
             return;
         }
 
         if (string.IsNullOrWhiteSpace(downloadResult.ConfigJson) ||
             !AppStateStore.TryDeserialize(downloadResult.ConfigJson, out var remoteState))
         {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive config auto-restore skipped: invalid remote JSON.");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Google Drive config auto-restore skipped: invalid remote JSON.");
             return;
         }
 
@@ -326,7 +327,7 @@ internal sealed class MainForm : Form
         }
 
         var modifiedInfo = downloadResult.ModifiedTimeUtc?.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") ?? "unknown";
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Config restored from Google Drive (modified: {modifiedInfo}).");
+        AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Config restored from Google Drive (modified: {modifiedInfo}).");
     }
 
     private bool TryAttachGoogleDriveCredentialsFromDefaultFile(out string sourcePath)
@@ -338,7 +339,7 @@ internal sealed class MainForm : Form
                 out sourcePath,
                 out var error))
         {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive OAuth client not available: {error}");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Google Drive OAuth client not available: {error}");
             return false;
         }
 
@@ -673,7 +674,7 @@ internal sealed class MainForm : Form
         }
 
         _appState.EvernoteShowIgnoredItems = shouldShowIgnored;
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Evernote show ignored set: {shouldShowIgnored}");
+        AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Evernote show ignored set: {shouldShowIgnored}");
         QueueAppStateSave();
         LoadEvernoteTreeFromConfiguredRoot(showErrors: false, refreshTracking: false);
     }
@@ -706,7 +707,7 @@ internal sealed class MainForm : Form
         _appState.EvernoteLocalDbPath = selectedPath;
         _evernoteDbPathTextBox.Text = selectedPath;
         ResetEvernoteTrackingBaseline();
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Evernote root path set: {selectedPath}");
+        AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Evernote root path set: {selectedPath}");
         QueueAppStateSave();
 
         LoadEvernoteTreeFromConfiguredRoot(showErrors: true);
@@ -775,7 +776,7 @@ internal sealed class MainForm : Form
     private void SetEvernoteStatus(string message)
     {
         _evernoteStatusLabel.Text = message;
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Evernote status: {message}");
+        AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Evernote status: {message}");
     }
 
     private void SyncEvernoteShowIgnoredCheckboxFromState()
@@ -1060,12 +1061,12 @@ internal sealed class MainForm : Form
         if (tag.Kind == EvernoteTreeNodeKind.Stack)
         {
             _appState.SetEvernoteStackExportFileName(tag.Id, proposedValue);
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Stack export file set: {tag.Name} ({tag.Id}) -> {proposedValue}");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Stack export file set: {tag.Name} ({tag.Id}) -> {proposedValue}");
         }
         else
         {
             _appState.SetEvernoteNotebookExportFileName(tag.Id, proposedValue);
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Notebook export file set: {tag.Name} ({tag.Id}) -> {proposedValue}");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Notebook export file set: {tag.Name} ({tag.Id}) -> {proposedValue}");
         }
 
         UpdateNodeTextFromTag(node);
@@ -1088,12 +1089,12 @@ internal sealed class MainForm : Form
         if (tag.Kind == EvernoteTreeNodeKind.Stack)
         {
             _appState.SetEvernoteStackExportFileName(tag.Id, null);
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Stack export file cleared: {tag.Name} ({tag.Id})");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Stack export file cleared: {tag.Name} ({tag.Id})");
         }
         else
         {
             _appState.SetEvernoteNotebookExportFileName(tag.Id, null);
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Notebook export file cleared: {tag.Name} ({tag.Id})");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Notebook export file cleared: {tag.Name} ({tag.Id})");
         }
 
         UpdateNodeTextFromTag(node);
@@ -1265,7 +1266,7 @@ internal sealed class MainForm : Form
             }
             else
             {
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {message}");
+                AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] {message}");
             }
 
             return false;
@@ -1407,12 +1408,12 @@ internal sealed class MainForm : Form
 
                     if (!driveSyncResult.IsSuccess)
                     {
-                        Console.WriteLine(
+                        AppLogger.Debug(
                             $"[{DateTime.Now:HH:mm:ss}] Google Drive markdown sync failed: {driveSyncResult.Error}");
                     }
                     else
                     {
-                        Console.WriteLine(
+                        AppLogger.Debug(
                             $"[{DateTime.Now:HH:mm:ss}] Google Drive markdown sync ok: {driveSyncResult.UploadedFiles} file(s), {driveSyncResult.ConvertedGoogleDocs} Google Doc(s).");
                     }
                 }
@@ -1426,7 +1427,7 @@ internal sealed class MainForm : Form
             var cleanupInfo = deletedBackups > 0 ? $" | backups supprimes: {deletedBackups}" : string.Empty;
             var status = $"Export termine ({source}): {groupResults.Count} fichiers, {totalNotes} notes -> {exportedFiles}{cleanupInfo}";
             SetEvernoteStatus(status);
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {status}");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] {status}");
 
             if (showDialogs)
             {
@@ -1664,13 +1665,13 @@ internal sealed class MainForm : Form
     private static void LogEvernoteSelection(string type, string name, string id, bool isSelected)
     {
         var action = isSelected ? "selected" : "deselected";
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {type} {name} ({id}) {action}.");
+        AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] {type} {name} ({id}) {action}.");
     }
 
     private static void LogEvernoteIgnoreChange(string type, string name, string id, bool ignored)
     {
         var action = ignored ? "ignored" : "unignored";
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {type} {name} ({id}) {action}.");
+        AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] {type} {name} ({id}) {action}.");
     }
 
     private void TrayIcon_MouseClick(object? sender, MouseEventArgs e)
@@ -1991,7 +1992,7 @@ internal sealed class MainForm : Form
         catch (Exception exception)
         {
             LogPollingLock($"Sync exception: {exception.Message}");
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Distributed polling lock sync failed: {exception.Message}");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Distributed polling lock sync failed: {exception.Message}");
             if (showErrors)
             {
                 MessageBox.Show(
@@ -2683,8 +2684,7 @@ internal sealed class MainForm : Form
     private void LogPollingLock(string message)
     {
         var line = $"[PollingLock:{_localMachineInstanceId}] {message}";
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {line}");
-        AppLogger.Info(line);
+        AppLogger.Debug(line);
     }
 
     private string DescribePendingLocalRequest()
@@ -2758,7 +2758,7 @@ internal sealed class MainForm : Form
                         MessageBoxIcon.Error);
                 }
 
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Evernote polling failed: {exception.Message}");
+                AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Evernote polling failed: {exception.Message}");
                 return;
             }
 
@@ -3120,7 +3120,7 @@ internal sealed class MainForm : Form
             if (!uploadResult.IsSuccess)
             {
                 var error = uploadResult.Error ?? "Unknown Google Drive sync error.";
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive config sync failed: {error}");
+                AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Google Drive config sync failed: {error}");
                 if (showErrors)
                 {
                     MessageBox.Show(
@@ -3143,7 +3143,7 @@ internal sealed class MainForm : Form
             }
 
             var modifiedLabel = uploadResult.ModifiedTimeUtc?.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") ?? "n/a";
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive config synced (file: {fileId ?? "new"}, modified: {modifiedLabel}).");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Google Drive config synced (file: {fileId ?? "new"}, modified: {modifiedLabel}).");
         }
         finally
         {
@@ -3201,6 +3201,7 @@ internal sealed class MainForm : Form
             _appState.EvernotePollingIntervalMinutes,
             _appState.EvernotePollingPaused,
             _appState.MaxMarkdownFilesToKeep,
+            _appState.EnableDebugLogs,
             _appState.GoogleDriveSyncEnabled,
             _appState.GoogleDriveAutoRestoreOnStartup,
             _appState.GoogleDriveClientId,
@@ -3264,6 +3265,13 @@ internal sealed class MainForm : Form
         if (settingsForm.IsGoogleDriveAutoRestoreOnStartup != _appState.GoogleDriveAutoRestoreOnStartup)
         {
             _appState.GoogleDriveAutoRestoreOnStartup = settingsForm.IsGoogleDriveAutoRestoreOnStartup;
+            stateChanged = true;
+        }
+
+        if (settingsForm.IsDebugLoggingEnabled != _appState.EnableDebugLogs)
+        {
+            _appState.EnableDebugLogs = settingsForm.IsDebugLoggingEnabled;
+            AppLogger.SetDebugLoggingEnabled(_appState.EnableDebugLogs);
             stateChanged = true;
         }
 
@@ -3393,6 +3401,7 @@ internal sealed class MainForm : Form
         ApplyMachineLocalEvernoteSettings(source: _appState, target: importedState);
         _appState = importedState;
         _appState.Normalize();
+        AppLogger.SetDebugLoggingEnabled(_appState.EnableDebugLogs);
 
         var selectedApp = Enum.IsDefined(typeof(WrappedApp), _appState.LastSelectedApp)
             ? _appState.LastSelectedApp
@@ -3624,3 +3633,4 @@ internal sealed class MainForm : Form
         base.Dispose(disposing);
     }
 }
+

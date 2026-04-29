@@ -66,6 +66,9 @@ internal sealed class AppState
     internal bool GoogleDriveAutoRestoreOnStartup { get; set; }
 
     [JsonInclude]
+    internal bool EnableDebugLogs { get; set; }
+
+    [JsonInclude]
     internal string? GoogleDriveClientId { get; set; }
 
     [JsonInclude]

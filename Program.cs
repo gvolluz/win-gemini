@@ -5,25 +5,27 @@ internal static class Program
     [STAThread]
     private static void Main()
     {
-        AppLogger.Info("Application startup initiated.");
+        var startupState = AppStateStore.Load();
+        AppLogger.SetDebugLoggingEnabled(startupState.EnableDebugLogs);
+        AppLogger.Debug("Application startup initiated.");
         RegisterGlobalExceptionLogging();
 
         try
         {
             ApplicationConfiguration.Initialize();
-            AppLogger.Info("ApplicationConfiguration initialized.");
+            AppLogger.Debug("ApplicationConfiguration initialized.");
 
             using var loginForm = new LoginForm();
-            AppLogger.Info("LoginForm opened.");
+            AppLogger.Debug("LoginForm opened.");
             if (loginForm.ShowDialog() != DialogResult.OK)
             {
-                AppLogger.Info("Login canceled. Exiting.");
+                AppLogger.Debug("Login canceled. Exiting.");
                 return;
             }
 
-            AppLogger.Info("Login succeeded. Launching MainForm.");
+            AppLogger.Debug("Login succeeded. Launching MainForm.");
             Application.Run(new MainForm());
-            AppLogger.Info("Application.Run returned. Exiting.");
+            AppLogger.Debug("Application.Run returned. Exiting.");
         }
         catch (Exception exception)
         {

@@ -10,6 +10,7 @@ internal sealed class SettingsForm : Form
     private readonly Label _pollingPendingRequestLabel;
     private readonly Label _pollingNextStatePollLabel;
     private readonly NumericUpDown _maxMarkdownFilesNumeric;
+    private readonly CheckBox _enableDebugLogsCheckBox;
     private readonly CheckBox _googleDriveSyncEnabledCheckBox;
     private readonly CheckBox _googleDriveAutoRestoreCheckBox;
     private readonly TextBox _googleDriveFileIdTextBox;
@@ -36,6 +37,7 @@ internal sealed class SettingsForm : Form
     internal int SelectedEvernotePollingIntervalMinutes => (int)_pollIntervalMinutesNumeric.Value;
     internal bool IsEvernotePollingPaused => _pausePollingCheckBox.Checked;
     internal int SelectedMaxMarkdownFilesToKeep => (int)_maxMarkdownFilesNumeric.Value;
+    internal bool IsDebugLoggingEnabled => _enableDebugLogsCheckBox.Checked;
     internal bool IsGoogleDriveSyncEnabled => _googleDriveSyncEnabledCheckBox.Checked;
     internal bool IsGoogleDriveAutoRestoreOnStartup => _googleDriveAutoRestoreCheckBox.Checked;
     internal string? GoogleDriveClientId => NormalizeOptionalText(_googleDriveClientIdValue);
@@ -47,6 +49,7 @@ internal sealed class SettingsForm : Form
         int currentEvernotePollingIntervalMinutes,
         bool currentEvernotePollingPaused,
         int currentMaxMarkdownFilesToKeep,
+        bool currentEnableDebugLogs,
         bool currentGoogleDriveSyncEnabled,
         bool currentGoogleDriveAutoRestoreOnStartup,
         string? currentGoogleDriveClientId,
@@ -211,11 +214,20 @@ internal sealed class SettingsForm : Form
             Text = "Older files in ./markdown will be deleted automatically after each export."
         };
 
+        _enableDebugLogsCheckBox = new CheckBox
+        {
+            Left = 16,
+            Top = 282,
+            Width = 280,
+            Text = "Enable debug logs",
+            Checked = currentEnableDebugLogs
+        };
+
         var localConfigPathLabel = new Label
         {
             AutoSize = true,
             Left = 16,
-            Top = 294,
+            Top = 318,
             Text = $"Local config file: {AppConfig.LocalConfigFilePath}"
         };
 
@@ -223,7 +235,7 @@ internal sealed class SettingsForm : Form
         {
             AutoSize = true,
             Left = 16,
-            Top = 324,
+            Top = 348,
             Font = new Font(Font, FontStyle.Bold),
             Text = "Google Drive config sync"
         };
@@ -231,7 +243,7 @@ internal sealed class SettingsForm : Form
         _googleDriveSyncEnabledCheckBox = new CheckBox
         {
             Left = 16,
-            Top = 352,
+            Top = 376,
             Width = 330,
             Text = "Enable Google Drive sync",
             Checked = currentGoogleDriveSyncEnabled
@@ -240,7 +252,7 @@ internal sealed class SettingsForm : Form
         _googleDriveAutoRestoreCheckBox = new CheckBox
         {
             Left = 360,
-            Top = 352,
+            Top = 376,
             Width = 280,
             Text = "Auto-restore at startup",
             Checked = currentGoogleDriveAutoRestoreOnStartup
@@ -249,7 +261,7 @@ internal sealed class SettingsForm : Form
         var oauthHintLabel = new Label
         {
             Left = 16,
-            Top = 384,
+            Top = 408,
             Width = 660,
             Height = 36,
             Text = "Clique sur le bouton ci-dessous: une fenetre Google OAuth standard s'ouvre pour te connecter."
@@ -259,7 +271,7 @@ internal sealed class SettingsForm : Form
         {
             AutoSize = true,
             Left = 16,
-            Top = 424,
+            Top = 448,
             Width = 220,
             Text = "Se connecter avec Google"
         };
@@ -268,7 +280,7 @@ internal sealed class SettingsForm : Form
         _googleOAuthStatusLabel = new Label
         {
             Left = 252,
-            Top = 430,
+            Top = 454,
             Width = 424,
             Height = 32,
             Text = HasSavedOAuthClient() ? "OAuth status: configured." : "OAuth status: not connected."
@@ -277,7 +289,7 @@ internal sealed class SettingsForm : Form
         _googleOAuthClientSourceLabel = new Label
         {
             Left = 16,
-            Top = 464,
+            Top = 488,
             Width = 660,
             Height = 32,
             Text = $"OAuth client source: {(File.Exists(AppConfig.GoogleDriveOAuthClientJsonPath) ? AppConfig.GoogleDriveOAuthClientJsonPath : "(not detected)")}"
@@ -287,14 +299,14 @@ internal sealed class SettingsForm : Form
         {
             AutoSize = true,
             Left = 16,
-            Top = 502,
+            Top = 526,
             Text = "Drive file ID (optional):"
         };
 
         _googleDriveFileIdTextBox = new TextBox
         {
             Left = 16,
-            Top = 524,
+            Top = 548,
             Width = 660,
             Text = currentGoogleDriveConfigFileId ?? string.Empty
         };
@@ -304,7 +316,7 @@ internal sealed class SettingsForm : Form
             Text = "Save",
             DialogResult = DialogResult.OK,
             Left = 500,
-            Top = 558,
+            Top = 582,
             Width = 80
         };
 
@@ -313,7 +325,7 @@ internal sealed class SettingsForm : Form
             Text = "Cancel",
             DialogResult = DialogResult.Cancel,
             Left = 588,
-            Top = 558,
+            Top = 582,
             Width = 80
         };
 
@@ -321,7 +333,7 @@ internal sealed class SettingsForm : Form
         {
             Text = "Export settings",
             Left = 16,
-            Top = 558,
+            Top = 582,
             Width = 130
         };
         exportButton.Click += (_, _) => ExportSettingsRequested?.Invoke();
@@ -330,7 +342,7 @@ internal sealed class SettingsForm : Form
         {
             Text = "Import settings",
             Left = 154,
-            Top = 558,
+            Top = 582,
             Width = 130
         };
         importButton.Click += (_, _) => ImportSettingsRequested?.Invoke();
@@ -348,6 +360,7 @@ internal sealed class SettingsForm : Form
         Controls.Add(maxMarkdownLabel);
         Controls.Add(_maxMarkdownFilesNumeric);
         Controls.Add(evernoteHelpLabel);
+        Controls.Add(_enableDebugLogsCheckBox);
         Controls.Add(localConfigPathLabel);
         Controls.Add(driveSectionLabel);
         Controls.Add(_googleDriveSyncEnabledCheckBox);
