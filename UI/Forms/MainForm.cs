@@ -23,6 +23,9 @@ internal sealed partial class MainForm : Form
     private readonly ContextMenuStrip _trayMenu;
     private readonly NotifyIcon _trayIcon;
     private readonly ContextMenuStrip _evernoteTreeNodeMenu;
+    private readonly IGoogleDriveSyncService _googleDriveSyncService;
+    private readonly IEvernoteLocalDbService _evernoteLocalDbService;
+    private readonly IEvernoteChangeDetectionService _evernoteChangeDetectionService;
     private readonly TextBox _evernoteDbPathTextBox;
     private readonly TreeView _evernoteTreeView;
     private readonly Label _evernoteStatusLabel;
@@ -81,9 +84,15 @@ internal sealed partial class MainForm : Form
     private DateTimeOffset _lastLocalPollingStateWriteUtc = DateTimeOffset.MinValue;
     private string? _lastLocalPollingStateSignature;
 
-    internal MainForm()
+    internal MainForm(
+        IGoogleDriveSyncService? googleDriveSyncService = null,
+        IEvernoteLocalDbService? evernoteLocalDbService = null,
+        IEvernoteChangeDetectionService? evernoteChangeDetectionService = null)
     {
         AppLogger.Debug("MainForm constructor started.");
+        _googleDriveSyncService = googleDriveSyncService ?? GoogleDriveSyncServiceAdapter.Instance;
+        _evernoteLocalDbService = evernoteLocalDbService ?? EvernoteLocalDbServiceAdapter.Instance;
+        _evernoteChangeDetectionService = evernoteChangeDetectionService ?? EvernoteChangeDetectionService.Instance;
         _localMachineHostName = NormalizeHostName(Environment.MachineName);
         _localMachineInstanceSuffix = BuildStableInstanceSuffix();
         _localMachineInstanceId = $"{_localMachineHostName}:{_localMachineInstanceSuffix}";
@@ -254,7 +263,7 @@ internal sealed partial class MainForm : Form
     private async Task TryAutoRestoreConfigFromGoogleDriveAsync()
     {
         var hasLocalConfigFile = File.Exists(AppConfig.LocalConfigFilePath) || File.Exists(AppConfig.LegacyStateFilePath);
-        if (!GoogleDriveConfigSyncService.IsConfigured(_appState) &&
+        if (!_googleDriveSyncService.IsConfigured(_appState) &&
             TryAttachGoogleDriveCredentialsFromDefaultFile(out var loadedPath))
         {
             AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Google Drive OAuth client loaded from: {loadedPath}");
@@ -266,14 +275,14 @@ internal sealed partial class MainForm : Form
         }
 
         var shouldAttemptAutoRestore = _appState.GoogleDriveAutoRestoreOnStartup || !hasLocalConfigFile;
-        if (!shouldAttemptAutoRestore || !GoogleDriveConfigSyncService.IsConfigured(_appState))
+        if (!shouldAttemptAutoRestore || !_googleDriveSyncService.IsConfigured(_appState))
         {
             return;
         }
 
         var localFallbackState = _appState;
 
-        var downloadResult = await GoogleDriveConfigSyncService.DownloadConfigAsync(_appState, CancellationToken.None);
+        var downloadResult = await _googleDriveSyncService.DownloadConfigAsync(_appState, CancellationToken.None);
         if (downloadResult.IsNotFound)
         {
             AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Google Drive config auto-restore: no remote config found.");
@@ -333,7 +342,7 @@ internal sealed partial class MainForm : Form
     private bool TryAttachGoogleDriveCredentialsFromDefaultFile(out string sourcePath)
     {
         sourcePath = string.Empty;
-        if (!GoogleDriveConfigSyncService.TryLoadClientSecretsFromDefaultLocations(
+        if (!_googleDriveSyncService.TryLoadClientSecretsFromDefaultLocations(
                 out var clientId,
                 out var clientSecret,
                 out sourcePath,
@@ -748,7 +757,7 @@ internal sealed partial class MainForm : Form
 
         try
         {
-            var stacks = EvernoteLocalDbService.GetStacksAndNotebooks(rootPath, out var dbPath);
+            var stacks = _evernoteLocalDbService.GetStacksAndNotebooks(rootPath, out var dbPath);
             PopulateEvernoteTree(stacks);
             SetEvernoteStatus(
                 $"DB detectee: {dbPath} | Stacks: {stacks.Count} | Notebooks: {stacks.Sum(stack => stack.Notebooks.Count)}");
@@ -1356,7 +1365,7 @@ internal sealed partial class MainForm : Form
             var exportTasks = groups
                 .Select(group => Task.Run(() =>
                 {
-                    var result = EvernoteLocalDbService.ExportNotebookGroupToMarkdown(
+                    var result = _evernoteLocalDbService.ExportNotebookGroupToMarkdown(
                         rootPath,
                         group.NotebookIds,
                         group.ExportFileBaseName,
@@ -1380,7 +1389,7 @@ internal sealed partial class MainForm : Form
                 return false;
             }
 
-            if (GoogleDriveConfigSyncService.IsConfigured(_appState))
+            if (_googleDriveSyncService.IsConfigured(_appState))
             {
                 var uploadItems = new List<EvernoteDriveFileUploadItem>();
                 foreach (var result in groupResults)
@@ -1401,7 +1410,7 @@ internal sealed partial class MainForm : Form
                 if (uploadItems.Count > 0)
                 {
                     SetEvernoteExportProgressIndeterminate("Sync Google Drive en cours...");
-                    var driveSyncResult = await GoogleDriveConfigSyncService.SyncEvernoteMarkdownFilesAsync(
+                    var driveSyncResult = await _googleDriveSyncService.SyncEvernoteMarkdownFilesAsync(
                         _appState,
                         uploadItems,
                         CancellationToken.None);
@@ -1779,7 +1788,7 @@ internal sealed partial class MainForm : Form
             return;
         }
 
-        if (!GoogleDriveConfigSyncService.IsConfigured(_appState))
+        if (!_googleDriveSyncService.IsConfigured(_appState))
         {
             _lockOwnerInstanceId = _localMachineInstanceId;
             _lockOwnerDisplayName = GetLocalDisplayName();
@@ -1792,7 +1801,7 @@ internal sealed partial class MainForm : Form
         try
         {
             LogPollingLock($"Sync start (processIncomingRequests={processIncomingRequests}, paused={_appState.EvernotePollingPaused}, pending={DescribePendingLocalRequest()}).");
-            var metaListResult = await GoogleDriveConfigSyncService.ListPollingStateMetasAsync(_appState, CancellationToken.None);
+            var metaListResult = await _googleDriveSyncService.ListPollingStateMetasAsync(_appState, CancellationToken.None);
             if (!metaListResult.IsSuccess)
             {
                 LogPollingLock($"State meta list #1 failed: {metaListResult.Error ?? "unknown error"}");
@@ -1857,7 +1866,7 @@ internal sealed partial class MainForm : Form
             if (ShouldUpsertLocalPollingState(localDocument))
             {
                 LogPollingLock($"Upserting local state '{_localMachineStateFileName}' (fileId={_localMachineStateFileId ?? "new"}): paused={localDocument.PauseAutomaticPolling}, pending={DescribePending(localDocument.PendingTakeoverRequest)}.");
-                var upsertResult = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+                var upsertResult = await _googleDriveSyncService.UpsertPollingStateAsync(
                     _appState,
                     _localMachineStateFileName,
                     localDocument,
@@ -1894,7 +1903,7 @@ internal sealed partial class MainForm : Form
                 LogPollingLock("Local state upsert skipped (no relevant change, heartbeat not due).");
             }
 
-            metaListResult = await GoogleDriveConfigSyncService.ListPollingStateMetasAsync(_appState, CancellationToken.None);
+            metaListResult = await _googleDriveSyncService.ListPollingStateMetasAsync(_appState, CancellationToken.None);
             if (!metaListResult.IsSuccess)
             {
                 LogPollingLock($"State meta list #2 failed: {metaListResult.Error ?? "unknown error"}");
@@ -1920,7 +1929,7 @@ internal sealed partial class MainForm : Form
                 ApplyEvernotePollingSettings();
                 SaveAppStateNow(queueGoogleDriveSync: false);
                 localDocument = BuildLocalPollingStateDocument();
-                var forcedPauseResult = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+                var forcedPauseResult = await _googleDriveSyncService.UpsertPollingStateAsync(
                     _appState,
                     _localMachineStateFileName,
                     localDocument,
@@ -2076,7 +2085,7 @@ internal sealed partial class MainForm : Form
                 .ToList();
         }
 
-        var fullListResult = await GoogleDriveConfigSyncService.ListPollingStatesAsync(_appState, CancellationToken.None);
+        var fullListResult = await _googleDriveSyncService.ListPollingStatesAsync(_appState, CancellationToken.None);
         if (!fullListResult.IsSuccess)
         {
             LogPollingLock($"State full list {reason} failed: {fullListResult.Error ?? "unknown error"}");
@@ -2238,7 +2247,7 @@ internal sealed partial class MainForm : Form
             updatedLocalDocument.PendingTakeoverRequest = null;
             updatedLocalDocument.PauseAutomaticPolling = true;
             updatedLocalDocument.UpdatedAtUtc = nowUtc;
-            var localUpsert = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+            var localUpsert = await _googleDriveSyncService.UpsertPollingStateAsync(
                 _appState,
                 _localMachineStateFileName,
                 updatedLocalDocument,
@@ -2271,7 +2280,7 @@ internal sealed partial class MainForm : Form
         var preferredFileId = requesterState.FileId;
         for (var attempt = 1; attempt <= 3; attempt++)
         {
-            var upsert = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+            var upsert = await _googleDriveSyncService.UpsertPollingStateAsync(
                 _appState,
                 requesterState.FileName,
                 updatedRequesterDocument,
@@ -2291,7 +2300,7 @@ internal sealed partial class MainForm : Form
                 continue;
             }
 
-            var verificationList = await GoogleDriveConfigSyncService.ListPollingStatesAsync(_appState, CancellationToken.None);
+            var verificationList = await _googleDriveSyncService.ListPollingStatesAsync(_appState, CancellationToken.None);
             if (!verificationList.IsSuccess)
             {
                 LogPollingLock($"Requester verify list failed on attempt {attempt}/3: {verificationList.Error ?? "unknown error"}.");
@@ -2562,7 +2571,7 @@ internal sealed partial class MainForm : Form
         UpdateSettingsLockStatus();
         try
         {
-            if (!GoogleDriveConfigSyncService.IsConfigured(_appState))
+            if (!_googleDriveSyncService.IsConfigured(_appState))
             {
                 _pendingTakeoverRequestId = null;
                 _pendingTakeoverTargetInstanceId = null;
@@ -2578,7 +2587,7 @@ internal sealed partial class MainForm : Form
                 return;
             }
 
-            var deleteResult = await GoogleDriveConfigSyncService.DeleteAllPollingStatesAsync(_appState, CancellationToken.None);
+            var deleteResult = await _googleDriveSyncService.DeleteAllPollingStatesAsync(_appState, CancellationToken.None);
             LogPollingLock($"Force lock delete states: success={deleteResult.IsSuccess}, deleted={deleteResult.DeletedFiles}, error={deleteResult.Error ?? "none"}.");
             if (!deleteResult.IsSuccess)
             {
@@ -2610,7 +2619,7 @@ internal sealed partial class MainForm : Form
             localDocument.PendingTakeoverRequest = null;
             localDocument.PauseAutomaticPolling = false;
             localDocument.UpdatedAtUtc = DateTimeOffset.UtcNow;
-            var upsert = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+            var upsert = await _googleDriveSyncService.UpsertPollingStateAsync(
                 _appState,
                 _localMachineStateFileName,
                 localDocument,
@@ -2703,7 +2712,7 @@ internal sealed partial class MainForm : Form
             string dbPath;
             try
             {
-                trackingSnapshot = EvernoteLocalDbService.GetTrackingSnapshot(rootPath, out dbPath);
+                trackingSnapshot = _evernoteLocalDbService.GetTrackingSnapshot(rootPath, out dbPath);
             }
             catch (Exception exception)
             {
@@ -2739,8 +2748,10 @@ internal sealed partial class MainForm : Form
                 .Select(notebook => notebook.NotebookId)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
-            var currentNotebookMap = BuildNotebookSnapshotMap(trackingSnapshot.NotebookSnapshots);
-            var changeSummary = AnalyzeChangedNotes(monitoredNotebookIds, previousNotebookMap, currentNotebookMap);
+            var changeSummary = _evernoteChangeDetectionService.AnalyzeChangedNotes(
+                monitoredNotebookIds,
+                previousNotebookMap,
+                trackingSnapshot.NotebookSnapshots);
             if (changeSummary.NoteChangeCount >= 1)
             {
                 var targetExportFileNames = monitoredNotebooks
@@ -2781,75 +2792,6 @@ internal sealed partial class MainForm : Form
             _evernotePollingInProgress = false;
             RefreshTrayPollingIconState();
         }
-    }
-
-    private static Dictionary<string, Dictionary<string, EvernoteNoteSnapshotState>> BuildNotebookSnapshotMap(
-        IEnumerable<EvernoteContainerNoteSnapshotState> containers)
-    {
-        var map = new Dictionary<string, Dictionary<string, EvernoteNoteSnapshotState>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var container in containers)
-        {
-            var notebookId = container.ContainerId ?? string.Empty;
-            if (!map.TryGetValue(notebookId, out var noteMap))
-            {
-                noteMap = new Dictionary<string, EvernoteNoteSnapshotState>(StringComparer.OrdinalIgnoreCase);
-                map[notebookId] = noteMap;
-            }
-
-            foreach (var note in container.Notes ?? [])
-            {
-                if (string.IsNullOrWhiteSpace(note.NoteId))
-                {
-                    continue;
-                }
-
-                noteMap[note.NoteId] = note;
-            }
-        }
-
-        return map;
-    }
-
-    private static EvernoteChangeSummary AnalyzeChangedNotes(
-        IReadOnlyCollection<string> monitoredNotebookIds,
-        Dictionary<string, Dictionary<string, EvernoteNoteSnapshotState>> previousMap,
-        Dictionary<string, Dictionary<string, EvernoteNoteSnapshotState>> currentMap)
-    {
-        var changeCount = 0;
-        var changedNotebookIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var notebookId in monitoredNotebookIds.Distinct(StringComparer.OrdinalIgnoreCase))
-        {
-            previousMap.TryGetValue(notebookId, out var previousNotes);
-            currentMap.TryGetValue(notebookId, out var currentNotes);
-
-            previousNotes ??= new Dictionary<string, EvernoteNoteSnapshotState>(StringComparer.OrdinalIgnoreCase);
-            currentNotes ??= new Dictionary<string, EvernoteNoteSnapshotState>(StringComparer.OrdinalIgnoreCase);
-
-            var noteIds = new HashSet<string>(previousNotes.Keys, StringComparer.OrdinalIgnoreCase);
-            noteIds.UnionWith(currentNotes.Keys);
-
-            foreach (var noteId in noteIds)
-            {
-                var existedBefore = previousNotes.TryGetValue(noteId, out var oldNote);
-                var existsNow = currentNotes.TryGetValue(noteId, out var newNote);
-
-                if (!existedBefore || !existsNow)
-                {
-                    changeCount++;
-                    changedNotebookIds.Add(notebookId);
-                    continue;
-                }
-
-                if (oldNote?.CreatedMs != newNote?.CreatedMs || oldNote?.UpdatedMs != newNote?.UpdatedMs)
-                {
-                    changeCount++;
-                    changedNotebookIds.Add(notebookId);
-                }
-            }
-        }
-
-        return new EvernoteChangeSummary(changeCount, changedNotebookIds);
     }
 
     protected override void Dispose(bool disposing)

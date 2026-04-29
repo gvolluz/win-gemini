@@ -21,7 +21,8 @@ internal sealed partial class MainForm
             _appState.GoogleDriveAutoRestoreOnStartup,
             _appState.GoogleDriveClientId,
             _appState.GoogleDriveClientSecret,
-            _appState.GoogleDriveConfigFileId);
+            _appState.GoogleDriveConfigFileId,
+            _googleDriveSyncService);
         _settingsFormOpenInstance = settingsForm;
         settingsForm.FormClosed += (_, _) =>
         {

@@ -31,7 +31,7 @@ internal sealed partial class MainForm
 
     private void QueueGoogleDriveSync()
     {
-        if (_suspendGoogleDriveSyncQueue || !GoogleDriveConfigSyncService.IsConfigured(_appState))
+        if (_suspendGoogleDriveSyncQueue || !_googleDriveSyncService.IsConfigured(_appState))
         {
             return;
         }
@@ -48,7 +48,7 @@ internal sealed partial class MainForm
 
     private async Task SyncConfigToGoogleDriveAsync(bool showErrors)
     {
-        if (_googleDriveSyncInProgress || !GoogleDriveConfigSyncService.IsConfigured(_appState))
+        if (_googleDriveSyncInProgress || !_googleDriveSyncService.IsConfigured(_appState))
         {
             return;
         }
@@ -58,7 +58,7 @@ internal sealed partial class MainForm
         {
             var syncState = CreateSharedSyncState(_appState);
             var json = AppStateStore.Serialize(syncState);
-            var uploadResult = await GoogleDriveConfigSyncService.UploadConfigAsync(
+            var uploadResult = await _googleDriveSyncService.UploadConfigAsync(
                 _appState,
                 json,
                 CancellationToken.None);

@@ -17,10 +17,6 @@ internal sealed partial class MainForm
         int CompletedSteps,
         string Message);
 
-    private sealed record EvernoteChangeSummary(
-        int NoteChangeCount,
-        IReadOnlySet<string> ChangedNotebookIds);
-
     private enum EvernoteTreeNodeKind
     {
         Stack,

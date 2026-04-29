@@ -2,6 +2,7 @@ namespace WinGeminiWrapper;
 
 internal sealed class SettingsForm : Form
 {
+    private readonly IGoogleDriveSyncService _googleDriveSyncService;
     private readonly ComboBox _closeBehaviorComboBox;
     private readonly NumericUpDown _pollIntervalMinutesNumeric;
     private readonly CheckBox _pausePollingCheckBox;
@@ -54,8 +55,10 @@ internal sealed class SettingsForm : Form
         bool currentGoogleDriveAutoRestoreOnStartup,
         string? currentGoogleDriveClientId,
         string? currentGoogleDriveClientSecret,
-        string? currentGoogleDriveConfigFileId)
+        string? currentGoogleDriveConfigFileId,
+        IGoogleDriveSyncService? googleDriveSyncService = null)
     {
+        _googleDriveSyncService = googleDriveSyncService ?? GoogleDriveSyncServiceAdapter.Instance;
         _googleDriveClientIdValue = NormalizeOptionalText(currentGoogleDriveClientId);
         _googleDriveClientSecretValue = NormalizeOptionalText(currentGoogleDriveClientSecret);
         _confirmedPausePollingState = currentEvernotePollingPaused;
@@ -466,7 +469,7 @@ internal sealed class SettingsForm : Form
 
         try
         {
-            var result = await GoogleDriveConfigSyncService.AuthorizeInteractiveAsync(
+            var result = await _googleDriveSyncService.AuthorizeInteractiveAsync(
                 _googleDriveClientIdValue ?? string.Empty,
                 _googleDriveClientSecretValue ?? string.Empty,
                 NormalizeOptionalText(_googleDriveFileIdTextBox.Text),
@@ -512,7 +515,7 @@ internal sealed class SettingsForm : Form
             return true;
         }
 
-        if (GoogleDriveConfigSyncService.TryLoadClientSecretsFromDefaultLocations(
+        if (_googleDriveSyncService.TryLoadClientSecretsFromDefaultLocations(
                 out var autoClientId,
                 out var autoClientSecret,
                 out var sourcePath,
@@ -538,7 +541,7 @@ internal sealed class SettingsForm : Form
             return false;
         }
 
-        if (!GoogleDriveConfigSyncService.TryExtractClientSecretsFromFile(
+        if (!_googleDriveSyncService.TryExtractClientSecretsFromFile(
                 dialog.FileName,
                 out var fileClientId,
                 out var fileClientSecret,
