@@ -9,3 +9,11 @@ ExportEvernote/
 .idea/
 *.user
 *.suo
+
+# Local secrets / OAuth artifacts (must never be committed)
+google-oauth-client.json
+credentials.json
+local-config.json
+app-state.json
+GoogleDriveTokens/
+*.secrets.json
