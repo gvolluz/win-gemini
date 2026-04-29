@@ -1,4 +1,4 @@
-namespace WinGeminiWrapper;
+﻿namespace WinGemini;
 
 internal sealed partial class MainForm
 {
@@ -25,6 +25,7 @@ internal sealed partial class MainForm
 
     private void UpdateTrayMenuItems()
     {
+        _switchAppMenuItem.Text = UiLanguageService.T("Main.Tray.SwitchTo");
         _switchAppMenuItem.DropDownItems.Clear();
         foreach (var app in Enum.GetValues<WrappedApp>())
         {
@@ -67,7 +68,29 @@ internal sealed partial class MainForm
         var appName = AppConfig.GetAppDisplayName(_currentApp);
         Text = AppVersionProvider.FormatWindowTitle(appName);
         _trayIcon.Text = appName;
+        ApplyLocalizedChromeText();
+        ApplyLocalizedEvernoteExportText();
         UpdateTrayMenuItems();
+    }
+
+    private void ApplyLocalizedChromeText()
+    {
+        foreach (var app in Enum.GetValues<WrappedApp>())
+        {
+            if ((int)app >= 0 && (int)app < _appSwitcher.Items.Count)
+            {
+                _appSwitcher.Items[(int)app] = AppConfig.GetAppDisplayName(app);
+            }
+        }
+
+        _appTopBarLabel.Text = UiLanguageService.T("Main.TopBar.App");
+        _refreshTopBarButton.Text = UiLanguageService.T("Main.TopBar.Refresh");
+        _settingsTopBarButton.Text = UiLanguageService.T("Common.Settings");
+        _logoutTopBarButton.Text = UiLanguageService.T("Main.TopBar.LogOut");
+        _refreshTrayMenuItem.Text = UiLanguageService.T("Main.TopBar.Refresh");
+        _settingsTrayMenuItem.Text = UiLanguageService.T("Common.Settings");
+        _logoutTrayMenuItem.Text = UiLanguageService.T("Main.TopBar.LogOut");
+        _exitTrayMenuItem.Text = UiLanguageService.T("Main.Tray.Exit");
     }
 
     private void RefreshTrayPollingIconState(bool? pausedOverride = null)
@@ -281,8 +304,8 @@ internal sealed partial class MainForm
         var appName = AppConfig.GetAppDisplayName(_currentApp);
         _trayIcon.ShowBalloonTip(
             2000,
-            $"{appName} is still running",
-            "Use the tray icon to reopen or exit.",
+            UiLanguageService.Tf("Main.Tray.Balloon.Title", appName),
+            UiLanguageService.T("Main.Tray.Balloon.Text"),
             ToolTipIcon.Info);
     }
 
@@ -307,3 +330,4 @@ internal sealed partial class MainForm
         Close();
     }
 }
+

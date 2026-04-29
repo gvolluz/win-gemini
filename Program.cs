@@ -1,4 +1,4 @@
-namespace WinGeminiWrapper;
+namespace WinGemini;
 
 internal static class Program
 {
@@ -6,6 +6,7 @@ internal static class Program
     private static void Main()
     {
         var startupState = AppStateStore.Load();
+        UiLanguageService.Apply(startupState.UiLanguageCode);
         AppLogger.SetDebugLoggingEnabled(startupState.EnableDebugLogs);
         AppLogger.Debug("Application startup initiated.");
         RegisterGlobalExceptionLogging();

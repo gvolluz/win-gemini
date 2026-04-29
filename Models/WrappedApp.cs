@@ -1,4 +1,4 @@
-namespace WinGeminiWrapper;
+﻿namespace WinGemini;
 
 internal enum WrappedApp
 {
@@ -7,3 +7,4 @@ internal enum WrappedApp
     EvernoteExport = 2,
     GoogleDrive = 3
 }
+

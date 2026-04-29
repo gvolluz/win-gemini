@@ -1,8 +1,19 @@
-namespace WinGeminiWrapper;
+﻿namespace WinGemini;
 
 internal sealed class SettingsForm : Form
 {
     private readonly IGoogleDriveSyncService _googleDriveSyncService;
+
+    private readonly Label _languageLabel;
+    private readonly Label _languageHelpLabel;
+    private readonly Label _closeBehaviorLabel;
+    private readonly Label _closeBehaviorHelpLabel;
+    private readonly Label _localConfigPathLabel;
+    private readonly Label _driveSectionLabel;
+    private readonly Label _oauthHintLabel;
+    private readonly Label _driveFileIdLabel;
+
+    private readonly ComboBox _languageComboBox;
     private readonly ComboBox _closeBehaviorComboBox;
     private readonly CheckBox _enableDebugLogsCheckBox;
     private readonly CheckBox _googleDriveSyncEnabledCheckBox;
@@ -11,11 +22,18 @@ internal sealed class SettingsForm : Form
     private readonly Label _googleOAuthStatusLabel;
     private readonly Label _googleOAuthClientSourceLabel;
     private readonly Button _googleOAuthConnectButton;
+    private readonly Button _saveButton;
+    private readonly Button _cancelButton;
+    private readonly Button _exportButton;
+    private readonly Button _importButton;
+    private readonly int _initialCloseBehaviorIndex;
 
     private string? _googleDriveClientIdValue;
     private string? _googleDriveClientSecretValue;
+
     internal event Action? ExportSettingsRequested;
     internal event Action? ImportSettingsRequested;
+    internal event Action<string?>? UiLanguagePreviewChanged;
 
     internal CloseButtonBehavior SelectedCloseButtonBehavior =>
         _closeBehaviorComboBox.SelectedIndex == 1
@@ -25,11 +43,17 @@ internal sealed class SettingsForm : Form
     internal bool IsDebugLoggingEnabled => _enableDebugLogsCheckBox.Checked;
     internal bool IsGoogleDriveSyncEnabled => _googleDriveSyncEnabledCheckBox.Checked;
     internal bool IsGoogleDriveAutoRestoreOnStartup => _googleDriveAutoRestoreCheckBox.Checked;
+    internal string? SelectedUiLanguageCode =>
+        _languageComboBox.SelectedItem is UiLanguageOption selected &&
+        !string.Equals(selected.Code, UiLanguageCatalog.AutoLanguageCode, StringComparison.OrdinalIgnoreCase)
+            ? selected.Code
+            : null;
     internal string? GoogleDriveClientId => NormalizeOptionalText(_googleDriveClientIdValue);
     internal string? GoogleDriveClientSecret => NormalizeOptionalText(_googleDriveClientSecretValue);
     internal string? GoogleDriveConfigFileId => NormalizeOptionalText(_googleDriveFileIdTextBox.Text);
 
     internal SettingsForm(
+        string? currentUiLanguageCode,
         CloseButtonBehavior currentCloseBehavior,
         bool currentEnableDebugLogs,
         bool currentGoogleDriveSyncEnabled,
@@ -42,198 +66,233 @@ internal sealed class SettingsForm : Form
         _googleDriveSyncService = googleDriveSyncService ?? GoogleDriveSyncServiceAdapter.Instance;
         _googleDriveClientIdValue = NormalizeOptionalText(currentGoogleDriveClientId);
         _googleDriveClientSecretValue = NormalizeOptionalText(currentGoogleDriveClientSecret);
+        _initialCloseBehaviorIndex = currentCloseBehavior == CloseButtonBehavior.CloseApp ? 1 : 0;
 
-        Text = AppVersionProvider.FormatWindowTitle("Settings");
         StartPosition = FormStartPosition.CenterParent;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MinimizeBox = false;
         MaximizeBox = false;
         ShowInTaskbar = false;
-        ClientSize = new Size(700, 510);
+        ClientSize = new Size(700, 530);
         Icon = AppIconProvider.GetIcon();
+        ApplyRightToLeft(UiLanguageService.IsRightToLeftCurrentLanguage());
 
-        var closeBehaviorLabel = new Label
+        _languageLabel = new Label { AutoSize = true, Left = 16, Top = 14 };
+        _languageHelpLabel = new Label { Left = 16, Top = 64, Width = 650, Height = 30 };
+        _closeBehaviorLabel = new Label { AutoSize = true, Left = 16, Top = 96 };
+        _closeBehaviorHelpLabel = new Label { Left = 16, Top = 156, Width = 650, Height = 30 };
+        _localConfigPathLabel = new Label { AutoSize = true, Left = 16, Top = 230 };
+        _driveSectionLabel = new Label { AutoSize = true, Left = 16, Top = 262, Font = new Font(Font, FontStyle.Bold) };
+        _oauthHintLabel = new Label { Left = 16, Top = 322, Width = 660, Height = 36 };
+        _driveFileIdLabel = new Label { AutoSize = true, Left = 16, Top = 436 };
+
+        _languageComboBox = new ComboBox
         {
-            AutoSize = true,
             Left = 16,
-            Top = 22,
-            Text = "Close button behavior:"
+            Top = 36,
+            Width = 420,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            DisplayMember = nameof(UiLanguageOption.NativeDisplayName)
         };
+        foreach (var option in UiLanguageService.GetLanguageOptions())
+        {
+            _languageComboBox.Items.Add(option);
+        }
+
+        var normalizedCurrentLanguage = string.IsNullOrWhiteSpace(currentUiLanguageCode)
+            ? UiLanguageCatalog.AutoLanguageCode
+            : currentUiLanguageCode;
+        if (_languageComboBox.Items.Count > 0)
+        {
+            _languageComboBox.SelectedIndex = 0;
+        }
+        for (var i = 0; i < _languageComboBox.Items.Count; i++)
+        {
+            if (_languageComboBox.Items[i] is not UiLanguageOption option)
+            {
+                continue;
+            }
+
+            if (!string.Equals(option.Code, normalizedCurrentLanguage, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            _languageComboBox.SelectedIndex = i;
+            break;
+        }
+
+        _languageComboBox.SelectedIndexChanged += LanguageComboBox_SelectedIndexChanged;
 
         _closeBehaviorComboBox = new ComboBox
         {
             Left = 16,
-            Top = 48,
+            Top = 122,
             Width = 420,
             DropDownStyle = ComboBoxStyle.DropDownList
         };
-        _closeBehaviorComboBox.Items.Add("Minimize to tray");
-        _closeBehaviorComboBox.Items.Add("Close app");
-        _closeBehaviorComboBox.SelectedIndex = currentCloseBehavior == CloseButtonBehavior.CloseApp ? 1 : 0;
+        _enableDebugLogsCheckBox = new CheckBox { Left = 16, Top = 196, Width = 320, Checked = currentEnableDebugLogs };
+        _googleDriveSyncEnabledCheckBox = new CheckBox { Left = 16, Top = 290, Width = 330, Checked = currentGoogleDriveSyncEnabled };
+        _googleDriveAutoRestoreCheckBox = new CheckBox { Left = 360, Top = 290, Width = 280, Checked = currentGoogleDriveAutoRestoreOnStartup };
 
-        var helpTextLabel = new Label
-        {
-            Left = 16,
-            Top = 82,
-            Width = 650,
-            Height = 30,
-            Text = "Controls what happens when you click the window close button."
-        };
-
-        _enableDebugLogsCheckBox = new CheckBox
-        {
-            Left = 16,
-            Top = 122,
-            Width = 280,
-            Text = "Enable debug logs",
-            Checked = currentEnableDebugLogs
-        };
-
-        var localConfigPathLabel = new Label
-        {
-            AutoSize = true,
-            Left = 16,
-            Top = 156,
-            Text = $"Local config file: {AppConfig.LocalConfigFilePath}"
-        };
-
-        var driveSectionLabel = new Label
-        {
-            AutoSize = true,
-            Left = 16,
-            Top = 188,
-            Font = new Font(Font, FontStyle.Bold),
-            Text = "Google Drive config sync"
-        };
-
-        _googleDriveSyncEnabledCheckBox = new CheckBox
-        {
-            Left = 16,
-            Top = 216,
-            Width = 330,
-            Text = "Enable Google Drive sync",
-            Checked = currentGoogleDriveSyncEnabled
-        };
-
-        _googleDriveAutoRestoreCheckBox = new CheckBox
-        {
-            Left = 360,
-            Top = 216,
-            Width = 280,
-            Text = "Auto-restore at startup",
-            Checked = currentGoogleDriveAutoRestoreOnStartup
-        };
-
-        var oauthHintLabel = new Label
-        {
-            Left = 16,
-            Top = 248,
-            Width = 660,
-            Height = 36,
-            Text = "Clique sur le bouton ci-dessous: une fenetre Google OAuth standard s'ouvre pour te connecter."
-        };
-
-        _googleOAuthConnectButton = new Button
-        {
-            AutoSize = true,
-            Left = 16,
-            Top = 288,
-            Width = 220,
-            Text = "Se connecter avec Google"
-        };
+        _googleOAuthConnectButton = new Button { AutoSize = true, Left = 16, Top = 362, Width = 220 };
         _googleOAuthConnectButton.Click += async (_, _) => await ConnectGoogleDriveOAuthAsync();
 
-        _googleOAuthStatusLabel = new Label
-        {
-            Left = 252,
-            Top = 294,
-            Width = 424,
-            Height = 32,
-            Text = HasSavedOAuthClient() ? "OAuth status: configured." : "OAuth status: not connected."
-        };
-
-        _googleOAuthClientSourceLabel = new Label
-        {
-            Left = 16,
-            Top = 328,
-            Width = 660,
-            Height = 32,
-            Text = $"OAuth client source: {(File.Exists(AppConfig.GoogleDriveOAuthClientJsonPath) ? AppConfig.GoogleDriveOAuthClientJsonPath : "(not detected)")}"
-        };
-
-        var driveFileIdLabel = new Label
-        {
-            AutoSize = true,
-            Left = 16,
-            Top = 366,
-            Text = "Drive file ID (optional):"
-        };
+        _googleOAuthStatusLabel = new Label { Left = 252, Top = 368, Width = 424, Height = 32 };
+        _googleOAuthClientSourceLabel = new Label { Left = 16, Top = 402, Width = 660, Height = 32 };
 
         _googleDriveFileIdTextBox = new TextBox
         {
             Left = 16,
-            Top = 388,
+            Top = 458,
             Width = 660,
             Text = currentGoogleDriveConfigFileId ?? string.Empty
         };
 
-        var saveButton = new Button
-        {
-            Text = "Save",
-            DialogResult = DialogResult.OK,
-            Left = 500,
-            Top = 460,
-            Width = 80
-        };
+        _saveButton = new Button { DialogResult = DialogResult.OK, Left = 500, Top = 494, Width = 80 };
+        _cancelButton = new Button { DialogResult = DialogResult.Cancel, Left = 588, Top = 494, Width = 80 };
+        _exportButton = new Button { Left = 16, Top = 494, Width = 130 };
+        _importButton = new Button { Left = 154, Top = 494, Width = 130 };
+        _exportButton.Click += (_, _) => ExportSettingsRequested?.Invoke();
+        _importButton.Click += (_, _) => ImportSettingsRequested?.Invoke();
 
-        var cancelButton = new Button
-        {
-            Text = "Cancel",
-            DialogResult = DialogResult.Cancel,
-            Left = 588,
-            Top = 460,
-            Width = 80
-        };
-
-        var exportButton = new Button
-        {
-            Text = "Export settings",
-            Left = 16,
-            Top = 460,
-            Width = 130
-        };
-        exportButton.Click += (_, _) => ExportSettingsRequested?.Invoke();
-
-        var importButton = new Button
-        {
-            Text = "Import settings",
-            Left = 154,
-            Top = 460,
-            Width = 130
-        };
-        importButton.Click += (_, _) => ImportSettingsRequested?.Invoke();
-
-        Controls.Add(closeBehaviorLabel);
+        Controls.Add(_languageLabel);
+        Controls.Add(_languageComboBox);
+        Controls.Add(_languageHelpLabel);
+        Controls.Add(_closeBehaviorLabel);
         Controls.Add(_closeBehaviorComboBox);
-        Controls.Add(helpTextLabel);
+        Controls.Add(_closeBehaviorHelpLabel);
         Controls.Add(_enableDebugLogsCheckBox);
-        Controls.Add(localConfigPathLabel);
-        Controls.Add(driveSectionLabel);
+        Controls.Add(_localConfigPathLabel);
+        Controls.Add(_driveSectionLabel);
         Controls.Add(_googleDriveSyncEnabledCheckBox);
         Controls.Add(_googleDriveAutoRestoreCheckBox);
-        Controls.Add(oauthHintLabel);
+        Controls.Add(_oauthHintLabel);
         Controls.Add(_googleOAuthConnectButton);
         Controls.Add(_googleOAuthStatusLabel);
         Controls.Add(_googleOAuthClientSourceLabel);
-        Controls.Add(driveFileIdLabel);
+        Controls.Add(_driveFileIdLabel);
         Controls.Add(_googleDriveFileIdTextBox);
-        Controls.Add(exportButton);
-        Controls.Add(importButton);
-        Controls.Add(saveButton);
-        Controls.Add(cancelButton);
+        Controls.Add(_exportButton);
+        Controls.Add(_importButton);
+        Controls.Add(_saveButton);
+        Controls.Add(_cancelButton);
 
-        AcceptButton = saveButton;
-        CancelButton = cancelButton;
+        AcceptButton = _saveButton;
+        CancelButton = _cancelButton;
+        ApplyLocalizedText();
+    }
+
+    private void ApplyLocalizedText()
+    {
+        Text = AppVersionProvider.FormatWindowTitle(UiLanguageService.T("Common.Settings"));
+        ApplyRightToLeft(UiLanguageService.IsRightToLeftCurrentLanguage());
+
+        var selectedLanguageCode = SelectedUiLanguageCode ?? UiLanguageCatalog.AutoLanguageCode;
+        _languageComboBox.SelectedIndexChanged -= LanguageComboBox_SelectedIndexChanged;
+        _languageComboBox.Items.Clear();
+        foreach (var option in UiLanguageService.GetLanguageOptions())
+        {
+            _languageComboBox.Items.Add(option);
+        }
+
+        if (_languageComboBox.Items.Count > 0)
+        {
+            _languageComboBox.SelectedIndex = 0;
+        }
+        for (var i = 0; i < _languageComboBox.Items.Count; i++)
+        {
+            if (_languageComboBox.Items[i] is not UiLanguageOption option)
+            {
+                continue;
+            }
+
+            if (!string.Equals(option.Code, selectedLanguageCode, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            _languageComboBox.SelectedIndex = i;
+            break;
+        }
+        _languageComboBox.SelectedIndexChanged += LanguageComboBox_SelectedIndexChanged;
+
+        _languageLabel.Text = $"{UiLanguageService.T("Settings.LanguageLabel")}:";
+        _languageHelpLabel.Text = UiLanguageService.T("Settings.LanguageHelp");
+
+        _closeBehaviorLabel.Text = UiLanguageService.T("Settings.CloseBehaviorLabel");
+        var previousSelection = _closeBehaviorComboBox.SelectedIndex;
+        _closeBehaviorComboBox.Items.Clear();
+        _closeBehaviorComboBox.Items.Add(UiLanguageService.T("Settings.CloseBehavior.MinimizeToTray"));
+        _closeBehaviorComboBox.Items.Add(UiLanguageService.T("Settings.CloseBehavior.CloseApp"));
+        if (_closeBehaviorComboBox.Items.Count > 0)
+        {
+            if (previousSelection >= 0 && previousSelection < _closeBehaviorComboBox.Items.Count)
+            {
+                _closeBehaviorComboBox.SelectedIndex = previousSelection;
+            }
+            else
+            {
+                _closeBehaviorComboBox.SelectedIndex = Math.Clamp(_initialCloseBehaviorIndex, 0, _closeBehaviorComboBox.Items.Count - 1);
+            }
+        }
+        _closeBehaviorHelpLabel.Text = UiLanguageService.T("Settings.CloseBehaviorHelp");
+
+        _enableDebugLogsCheckBox.Text = UiLanguageService.T("Settings.EnableDebugLogs");
+        _localConfigPathLabel.Text = UiLanguageService.Tf("Settings.LocalConfigFile", AppConfig.LocalConfigFilePath);
+        _driveSectionLabel.Text = UiLanguageService.T("Settings.GoogleDriveSection");
+        _googleDriveSyncEnabledCheckBox.Text = UiLanguageService.T("Settings.EnableGoogleDriveSync");
+        _googleDriveAutoRestoreCheckBox.Text = UiLanguageService.T("Settings.AutoRestoreOnStartup");
+        _oauthHintLabel.Text = UiLanguageService.T("Settings.GoogleOAuthHint");
+        _googleOAuthConnectButton.Text = UiLanguageService.T("Settings.ConnectWithGoogle");
+        _driveFileIdLabel.Text = UiLanguageService.T("Settings.DriveFileIdOptional");
+        _saveButton.Text = UiLanguageService.T("Common.Save");
+        _cancelButton.Text = UiLanguageService.T("Common.Cancel");
+        _exportButton.Text = UiLanguageService.T("Settings.ExportSettings");
+        _importButton.Text = UiLanguageService.T("Settings.ImportSettings");
+
+        UpdateOAuthStatusLabelConfiguredState();
+        UpdateOAuthClientSourceLabel();
+    }
+
+    private void LanguageComboBox_SelectedIndexChanged(object? sender, EventArgs e)
+    {
+        if (_languageComboBox.SelectedItem is not UiLanguageOption selected)
+        {
+            return;
+        }
+
+        var previewLanguage = string.Equals(selected.Code, UiLanguageCatalog.AutoLanguageCode, StringComparison.OrdinalIgnoreCase)
+            ? null
+            : selected.Code;
+        UiLanguagePreviewChanged?.Invoke(previewLanguage);
+        ApplyLocalizedText();
+    }
+
+    private void UpdateOAuthStatusLabelConfiguredState()
+    {
+        _googleOAuthStatusLabel.Text = HasSavedOAuthClient()
+            ? UiLanguageService.T("Settings.OAuthStatusConfigured")
+            : UiLanguageService.T("Settings.OAuthStatusNotConnected");
+    }
+
+    private void UpdateOAuthClientSourceLabel(string? sourceOverride = null)
+    {
+        var source = sourceOverride;
+        if (string.IsNullOrWhiteSpace(source))
+        {
+            source = File.Exists(AppConfig.GoogleDriveOAuthClientJsonPath)
+                ? AppConfig.GoogleDriveOAuthClientJsonPath
+                : UiLanguageService.T("Settings.NotDetected");
+        }
+
+        _googleOAuthClientSourceLabel.Text = UiLanguageService.Tf("Settings.OAuthClientSource", source);
+    }
+
+    private void ApplyRightToLeft(bool isRightToLeft)
+    {
+        RightToLeft = isRightToLeft ? RightToLeft.Yes : RightToLeft.No;
+        RightToLeftLayout = isRightToLeft;
     }
 
     private bool HasSavedOAuthClient()
@@ -251,7 +310,7 @@ internal sealed class SettingsForm : Form
 
         UseWaitCursor = true;
         _googleOAuthConnectButton.Enabled = false;
-        _googleOAuthStatusLabel.Text = "OAuth status: connecting...";
+        _googleOAuthStatusLabel.Text = UiLanguageService.T("Settings.OAuthStatusConnecting");
 
         try
         {
@@ -263,12 +322,12 @@ internal sealed class SettingsForm : Form
 
             if (!result.IsSuccess)
             {
-                var error = result.Error ?? "Unknown OAuth error.";
-                _googleOAuthStatusLabel.Text = $"OAuth status: failed ({error})";
+                var error = result.Error ?? UiLanguageService.T("Settings.UnknownOAuthError");
+                _googleOAuthStatusLabel.Text = UiLanguageService.Tf("Settings.OAuthStatusFailed", error);
                 MessageBox.Show(
                     this,
-                    $"Connexion OAuth echouee.{Environment.NewLine}{Environment.NewLine}{error}",
-                    "OAuth Google Drive",
+                    UiLanguageService.Tf("Settings.OAuthConnectionFailedMessage", error),
+                    UiLanguageService.T("Settings.GoogleOAuthTitle"),
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
                 return;
@@ -284,8 +343,8 @@ internal sealed class SettingsForm : Form
 
             var identity = !string.IsNullOrWhiteSpace(result.UserEmail)
                 ? result.UserEmail
-                : (result.UserDisplayName ?? "Google account connected");
-            _googleOAuthStatusLabel.Text = $"OAuth status: connected ({identity}).";
+                : (result.UserDisplayName ?? UiLanguageService.T("Settings.GoogleAccountConnectedFallback"));
+            _googleOAuthStatusLabel.Text = UiLanguageService.Tf("Settings.OAuthStatusConnected", identity);
         }
         finally
         {
@@ -309,13 +368,13 @@ internal sealed class SettingsForm : Form
         {
             _googleDriveClientIdValue = autoClientId;
             _googleDriveClientSecretValue = autoClientSecret;
-            _googleOAuthClientSourceLabel.Text = $"OAuth client source: {sourcePath}";
+            UpdateOAuthClientSourceLabel(sourcePath);
             return true;
         }
 
         using var dialog = new OpenFileDialog
         {
-            Title = "Select Google OAuth credentials JSON",
+            Title = UiLanguageService.T("Settings.SelectOAuthCredentialsJson"),
             Filter = "JSON files (*.json)|*.json|All files (*.*)|*.*",
             CheckFileExists = true,
             Multiselect = false
@@ -323,7 +382,7 @@ internal sealed class SettingsForm : Form
 
         if (dialog.ShowDialog(this) != DialogResult.OK || string.IsNullOrWhiteSpace(dialog.FileName))
         {
-            _googleOAuthStatusLabel.Text = "OAuth status: credentials file required.";
+            _googleOAuthStatusLabel.Text = UiLanguageService.T("Settings.OAuthStatusCredentialsFileRequired");
             return false;
         }
 
@@ -333,11 +392,11 @@ internal sealed class SettingsForm : Form
                 out var fileClientSecret,
                 out var extractError))
         {
-            _googleOAuthStatusLabel.Text = $"OAuth status: error ({extractError})";
+            _googleOAuthStatusLabel.Text = UiLanguageService.Tf("Settings.OAuthStatusError", extractError);
             MessageBox.Show(
                 this,
-                $"Impossible de lire les credentials OAuth.{Environment.NewLine}{Environment.NewLine}{extractError}",
-                "OAuth Google Drive",
+                UiLanguageService.Tf("Settings.UnableToReadOAuthCredentials", extractError),
+                UiLanguageService.T("Settings.GoogleOAuthTitle"),
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
             return false;
@@ -345,13 +404,13 @@ internal sealed class SettingsForm : Form
 
         _googleDriveClientIdValue = fileClientId;
         _googleDriveClientSecretValue = fileClientSecret;
-        _googleOAuthClientSourceLabel.Text = $"OAuth client source: {dialog.FileName}";
+        UpdateOAuthClientSourceLabel(dialog.FileName);
 
         try
         {
             Directory.CreateDirectory(AppConfig.AppDataRootFolder);
             File.Copy(dialog.FileName, AppConfig.GoogleDriveOAuthClientJsonPath, overwrite: true);
-            _googleOAuthClientSourceLabel.Text = $"OAuth client source: {AppConfig.GoogleDriveOAuthClientJsonPath}";
+            UpdateOAuthClientSourceLabel(AppConfig.GoogleDriveOAuthClientJsonPath);
         }
         catch
         {
@@ -368,3 +427,4 @@ internal sealed class SettingsForm : Form
             : value.Trim();
     }
 }
+

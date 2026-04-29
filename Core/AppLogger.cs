@@ -1,6 +1,6 @@
-using System.Text;
+﻿using System.Text;
 
-namespace WinGeminiWrapper;
+namespace WinGemini;
 
 internal static class AppLogger
 {
@@ -61,3 +61,4 @@ internal static class AppLogger
         }
     }
 }
+

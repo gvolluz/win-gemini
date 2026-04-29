@@ -1,4 +1,4 @@
-namespace WinGeminiWrapper;
+﻿namespace WinGemini;
 
 internal sealed partial class MainForm
 {
@@ -30,3 +30,4 @@ internal sealed partial class MainForm
         int ItemCount = 0,
         long? LatestChangeMs = null);
 }
+

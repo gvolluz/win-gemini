@@ -1,4 +1,4 @@
-namespace WinGeminiWrapper;
+﻿namespace WinGemini;
 
 internal sealed class EvernoteLocalDbServiceAdapter : IEvernoteLocalDbService
 {
@@ -29,3 +29,4 @@ internal sealed class EvernoteLocalDbServiceAdapter : IEvernoteLocalDbService
             exportBackupsDirectory,
             maxBackupsToKeep);
 }
+

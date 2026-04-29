@@ -1,4 +1,4 @@
-namespace WinGeminiWrapper;
+﻿namespace WinGemini;
 
 internal static class NavigationClassifier
 {
@@ -78,3 +78,4 @@ internal static class NavigationClassifier
                absoluteUri.Contains("oauth", StringComparison.OrdinalIgnoreCase);
     }
 }
+

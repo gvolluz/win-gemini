@@ -1,4 +1,4 @@
-namespace WinGeminiWrapper;
+﻿namespace WinGemini;
 
 internal sealed class GoogleDriveSyncServiceAdapter : IGoogleDriveSyncService
 {
@@ -80,3 +80,4 @@ internal sealed class GoogleDriveSyncServiceAdapter : IGoogleDriveSyncService
     public Task<GoogleDrivePollingStateDeleteResult> DeleteAllPollingStatesAsync(AppState state, CancellationToken cancellationToken) =>
         GoogleDriveConfigSyncService.DeleteAllPollingStatesAsync(state, cancellationToken);
 }
+

@@ -1,4 +1,4 @@
-namespace WinGeminiWrapper;
+﻿namespace WinGemini;
 
 internal sealed class EvernoteChangeDetectionService : IEvernoteChangeDetectionService
 {
@@ -78,3 +78,4 @@ internal sealed class EvernoteChangeDetectionService : IEvernoteChangeDetectionS
         return map;
     }
 }
+

@@ -1,9 +1,9 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$sourceExe = Join-Path $PSScriptRoot "WinGeminiWrapper.exe"
+$sourceExe = Join-Path $PSScriptRoot "WinGemini.exe"
 $installDir = Join-Path $env:LOCALAPPDATA "Programs\Win Gemini"
-$installedExe = Join-Path $installDir "WinGeminiWrapper.exe"
+$installedExe = Join-Path $installDir "WinGemini.exe"
 $dotNetRuntimeUrl = "https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe"
 $webView2BootstrapperUrl = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
 $dotNetVersionPrefix = "8.0."

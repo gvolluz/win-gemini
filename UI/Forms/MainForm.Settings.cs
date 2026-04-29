@@ -1,4 +1,4 @@
-namespace WinGeminiWrapper;
+﻿namespace WinGemini;
 
 internal sealed partial class MainForm
 {
@@ -11,7 +11,9 @@ internal sealed partial class MainForm
             return;
         }
 
+        var previousUiLanguageCode = _appState.UiLanguageCode;
         using var settingsForm = new SettingsForm(
+            _appState.UiLanguageCode,
             _appState.CloseButtonBehavior,
             _appState.EnableDebugLogs,
             _appState.GoogleDriveSyncEnabled,
@@ -29,6 +31,14 @@ internal sealed partial class MainForm
             }
         };
         settingsForm.ExportSettingsRequested += () => ExportSettingsWithDialog(settingsForm);
+        settingsForm.UiLanguagePreviewChanged += previewLanguageCode =>
+        {
+            UiLanguageService.Apply(previewLanguageCode);
+            UpdateAppChrome();
+            ApplyLocalizedEvernoteExportText();
+            UpdateEvernoteNodeMenuState();
+            UpdateEvernotePollingUiState();
+        };
         settingsForm.ImportSettingsRequested += () =>
         {
             if (!ImportSettingsWithDialog(settingsForm))
@@ -41,11 +51,17 @@ internal sealed partial class MainForm
         };
         if (settingsForm.ShowDialog(this) != DialogResult.OK)
         {
+            UiLanguageService.Apply(previousUiLanguageCode);
+            UpdateAppChrome();
+            ApplyLocalizedEvernoteExportText();
+            UpdateEvernoteNodeMenuState();
+            UpdateEvernotePollingUiState();
             _settingsFormOpenInstance = null;
             return;
         }
 
         var stateChanged = false;
+        var uiLanguageChanged = false;
 
         if (settingsForm.SelectedCloseButtonBehavior != _appState.CloseButtonBehavior)
         {
@@ -70,6 +86,14 @@ internal sealed partial class MainForm
             _appState.EnableDebugLogs = settingsForm.IsDebugLoggingEnabled;
             AppLogger.SetDebugLoggingEnabled(_appState.EnableDebugLogs);
             stateChanged = true;
+        }
+
+        if (!string.Equals(settingsForm.SelectedUiLanguageCode, _appState.UiLanguageCode, StringComparison.OrdinalIgnoreCase))
+        {
+            _appState.UiLanguageCode = settingsForm.SelectedUiLanguageCode;
+            UiLanguageService.Apply(_appState.UiLanguageCode);
+            stateChanged = true;
+            uiLanguageChanged = true;
         }
 
         if (!string.Equals(settingsForm.GoogleDriveClientId, _appState.GoogleDriveClientId, StringComparison.Ordinal))
@@ -97,6 +121,12 @@ internal sealed partial class MainForm
             return;
         }
 
+        if (uiLanguageChanged)
+        {
+            UpdateAppChrome();
+            UpdateEvernoteNodeMenuState();
+        }
+
         SaveAppStateNow(queueGoogleDriveSync: false);
         await SyncDistributedPollingStateAsync(showErrors: true, processIncomingRequests: false);
         _ = SyncConfigToGoogleDriveAsync(showErrors: true);
@@ -107,7 +137,7 @@ internal sealed partial class MainForm
     {
         using var dialog = new SaveFileDialog
         {
-            Title = "Export settings",
+            Title = UiLanguageService.T("Settings.ExportSettings"),
             Filter = "JSON files (*.json)|*.json|All files (*.*)|*.*",
             FileName = $"WinGemini-settings-{DateTime.Now:yyyyMMdd-HHmmss}.json",
             AddExtension = true,
@@ -126,8 +156,8 @@ internal sealed partial class MainForm
             File.WriteAllText(dialog.FileName, json);
             MessageBox.Show(
                 owner,
-                $"Settings exported to:{Environment.NewLine}{dialog.FileName}",
-                "Settings export",
+                UiLanguageService.Tf("Settings.ExportedTo", Environment.NewLine, dialog.FileName),
+                UiLanguageService.T("Settings.ExportSettings"),
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
         }
@@ -135,8 +165,8 @@ internal sealed partial class MainForm
         {
             MessageBox.Show(
                 owner,
-                $"Unable to export settings.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
-                "Settings export",
+                UiLanguageService.Tf("Settings.UnableToExport", exception.Message),
+                UiLanguageService.T("Settings.ExportSettings"),
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
         }
@@ -146,8 +176,8 @@ internal sealed partial class MainForm
     {
         if (MessageBox.Show(
                 owner,
-                "Importing a settings file will replace your current local configuration. Continue?",
-                "Import settings",
+                UiLanguageService.T("Settings.ImportWillReplaceConfirm"),
+                UiLanguageService.T("Settings.ImportSettings"),
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Warning) != DialogResult.Yes)
         {
@@ -156,7 +186,7 @@ internal sealed partial class MainForm
 
         using var dialog = new OpenFileDialog
         {
-            Title = "Import settings",
+            Title = UiLanguageService.T("Settings.ImportSettings"),
             Filter = "JSON files (*.json)|*.json|All files (*.*)|*.*",
             CheckFileExists = true,
             Multiselect = false
@@ -176,8 +206,8 @@ internal sealed partial class MainForm
         {
             MessageBox.Show(
                 owner,
-                $"Unable to read the selected file.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
-                "Import settings",
+                UiLanguageService.Tf("Settings.UnableToReadSelectedFile", exception.Message),
+                UiLanguageService.T("Settings.ImportSettings"),
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
             return false;
@@ -187,8 +217,8 @@ internal sealed partial class MainForm
         {
             MessageBox.Show(
                 owner,
-                "The selected file does not contain valid settings JSON.",
-                "Import settings",
+                UiLanguageService.T("Settings.InvalidSettingsJson"),
+                UiLanguageService.T("Settings.ImportSettings"),
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
             return false;
@@ -197,6 +227,7 @@ internal sealed partial class MainForm
         ApplyMachineLocalEvernoteSettings(source: _appState, target: importedState);
         _appState = importedState;
         _appState.Normalize();
+        UiLanguageService.Apply(_appState.UiLanguageCode);
         AppLogger.SetDebugLoggingEnabled(_appState.EnableDebugLogs);
 
         var selectedApp = Enum.IsDefined(typeof(WrappedApp), _appState.LastSelectedApp)
@@ -217,8 +248,8 @@ internal sealed partial class MainForm
 
         MessageBox.Show(
             owner,
-            $"Settings imported from:{Environment.NewLine}{dialog.FileName}",
-            "Import settings",
+                UiLanguageService.Tf("Settings.ImportedFrom", Environment.NewLine, dialog.FileName),
+            UiLanguageService.T("Settings.ImportSettings"),
             MessageBoxButtons.OK,
             MessageBoxIcon.Information);
         return true;
@@ -241,3 +272,4 @@ internal sealed partial class MainForm
         target.EvernotePollingIntervalMinutes = source.EvernotePollingIntervalMinutes;
     }
 }
+

@@ -1,8 +1,8 @@
-using Microsoft.Web.WebView2.Core;
+﻿using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 using System.Security.Cryptography;
 
-namespace WinGeminiWrapper;
+namespace WinGemini;
 
 internal sealed partial class MainForm : Form
 {
@@ -38,6 +38,15 @@ internal sealed partial class MainForm : Form
     private readonly Label _evernotePollingPendingRequestLabel;
     private readonly Label _evernotePollingNextStatePollLabel;
     private readonly NumericUpDown _evernoteMaxMarkdownFilesNumeric;
+    private Label _evernoteTitleLabel = null!;
+    private Label _evernoteSubtitleLabel = null!;
+    private Button _chooseEvernoteFolderButton = null!;
+    private Button _reloadEvernoteButton = null!;
+    private Button _exportEvernoteButton = null!;
+    private Label _evernotePollFrequencyLabel = null!;
+    private Label _evernoteMaxMarkdownLabel = null!;
+    private Label _evernoteMaxMarkdownHelpLabel = null!;
+    private Label _evernoteTreeHintLabel = null!;
     private readonly SemaphoreSlim _evernoteExportSemaphore = new(1, 1);
     private readonly Dictionary<WrappedApp, WebView2> _webViews = new();
     private readonly System.Windows.Forms.Timer _windowStateSaveTimer;
@@ -50,6 +59,14 @@ internal sealed partial class MainForm : Form
     private CoreWebView2Environment? _webViewEnvironment;
     private AppState _appState;
     private ToolStripMenuItem _switchAppMenuItem = null!;
+    private ToolStripLabel _appTopBarLabel = null!;
+    private ToolStripButton _refreshTopBarButton = null!;
+    private ToolStripButton _settingsTopBarButton = null!;
+    private ToolStripButton _logoutTopBarButton = null!;
+    private ToolStripMenuItem _refreshTrayMenuItem = null!;
+    private ToolStripMenuItem _settingsTrayMenuItem = null!;
+    private ToolStripMenuItem _logoutTrayMenuItem = null!;
+    private ToolStripMenuItem _exitTrayMenuItem = null!;
     private ToolStripMenuItem _toggleIgnoreEvernoteNodeMenuItem = null!;
     private ToolStripMenuItem _setExportFileNameEvernoteNodeMenuItem = null!;
     private ToolStripMenuItem _clearExportFileNameEvernoteNodeMenuItem = null!;
@@ -473,17 +490,20 @@ internal sealed partial class MainForm : Form
             GripStyle = ToolStripGripStyle.Hidden,
             RenderMode = ToolStripRenderMode.System
         };
-        var logoutButton = new ToolStripButton("Log out", null, async (_, _) => await LogoutAsync())
+        _logoutTopBarButton = new ToolStripButton(UiLanguageService.T("Main.TopBar.LogOut"), null, async (_, _) => await LogoutAsync())
         {
             Alignment = ToolStripItemAlignment.Right
         };
+        _appTopBarLabel = new ToolStripLabel(UiLanguageService.T("Main.TopBar.App"));
+        _refreshTopBarButton = new ToolStripButton(UiLanguageService.T("Main.TopBar.Refresh"), null, (_, _) => RefreshCurrentApp());
+        _settingsTopBarButton = new ToolStripButton(UiLanguageService.T("Common.Settings"), null, (_, _) => OpenSettings());
 
-        topBar.Items.Add(new ToolStripLabel("App:"));
+        topBar.Items.Add(_appTopBarLabel);
         topBar.Items.Add(_appSwitcher);
         topBar.Items.Add(new ToolStripSeparator());
-        topBar.Items.Add(new ToolStripButton("Refresh", null, (_, _) => RefreshCurrentApp()));
-        topBar.Items.Add(new ToolStripButton("Settings", null, (_, _) => OpenSettings()));
-        topBar.Items.Add(logoutButton);
+        topBar.Items.Add(_refreshTopBarButton);
+        topBar.Items.Add(_settingsTopBarButton);
+        topBar.Items.Add(_logoutTopBarButton);
 
         return topBar;
     }
@@ -491,14 +511,18 @@ internal sealed partial class MainForm : Form
     private ContextMenuStrip BuildTrayMenu()
     {
         var menu = new ContextMenuStrip();
-        _switchAppMenuItem = new ToolStripMenuItem("Switch to");
+        _switchAppMenuItem = new ToolStripMenuItem(UiLanguageService.T("Main.Tray.SwitchTo"));
+        _refreshTrayMenuItem = new ToolStripMenuItem(UiLanguageService.T("Main.TopBar.Refresh"), null, (_, _) => RefreshCurrentApp());
+        _settingsTrayMenuItem = new ToolStripMenuItem(UiLanguageService.T("Common.Settings"), null, (_, _) => OpenSettings());
+        _logoutTrayMenuItem = new ToolStripMenuItem(UiLanguageService.T("Main.TopBar.LogOut"), null, async (_, _) => await LogoutAsync());
+        _exitTrayMenuItem = new ToolStripMenuItem(UiLanguageService.T("Main.Tray.Exit"), null, (_, _) => ExitApplication());
         menu.Opening += (_, _) => UpdateTrayMenuItems();
 
         menu.Items.Add(_switchAppMenuItem);
-        menu.Items.Add("Refresh", null, (_, _) => RefreshCurrentApp());
-        menu.Items.Add("Settings", null, (_, _) => OpenSettings());
-        menu.Items.Add("Log out", null, async (_, _) => await LogoutAsync());
-        menu.Items.Add("Exit", null, (_, _) => ExitApplication());
+        menu.Items.Add(_refreshTrayMenuItem);
+        menu.Items.Add(_settingsTrayMenuItem);
+        menu.Items.Add(_logoutTrayMenuItem);
+        menu.Items.Add(_exitTrayMenuItem);
         UpdateTrayMenuItems();
 
         return menu;
@@ -507,11 +531,11 @@ internal sealed partial class MainForm : Form
     private ContextMenuStrip BuildEvernoteTreeNodeMenu()
     {
         var menu = new ContextMenuStrip();
-        _toggleIgnoreEvernoteNodeMenuItem = new ToolStripMenuItem("Ignore");
+        _toggleIgnoreEvernoteNodeMenuItem = new ToolStripMenuItem(UiLanguageService.T("Main.EvernoteMenu.Ignore"));
         _toggleIgnoreEvernoteNodeMenuItem.Click += (_, _) => ToggleIgnoreForContextNode();
-        _setExportFileNameEvernoteNodeMenuItem = new ToolStripMenuItem("Set export file name...");
+        _setExportFileNameEvernoteNodeMenuItem = new ToolStripMenuItem(UiLanguageService.Tf("Main.EvernoteMenu.SetExportFileForKind", UiLanguageService.T("Main.Evernote.Kind.Notebook")));
         _setExportFileNameEvernoteNodeMenuItem.Click += (_, _) => SetExportFileNameForContextNode();
-        _clearExportFileNameEvernoteNodeMenuItem = new ToolStripMenuItem("Clear export file name");
+        _clearExportFileNameEvernoteNodeMenuItem = new ToolStripMenuItem(UiLanguageService.T("Main.EvernoteMenu.ClearExportFileName"));
         _clearExportFileNameEvernoteNodeMenuItem.Click += (_, _) => ClearExportFileNameForContextNode();
         menu.Items.Add(_toggleIgnoreEvernoteNodeMenuItem);
         menu.Items.Add(new ToolStripSeparator());
@@ -559,15 +583,17 @@ internal sealed partial class MainForm : Form
         {
             AutoSize = true,
             Font = new Font(Font, FontStyle.Bold),
-            Text = "Evernote Export"
+            Text = UiLanguageService.T("Evernote.Title")
         };
+        _evernoteTitleLabel = titleLabel;
 
         var subtitleLabel = new Label
         {
             AutoSize = true,
             Margin = new Padding(0, 8, 0, 8),
-            Text = "Select the Evernote root folder, then export the checked notebooks."
+            Text = UiLanguageService.T("Evernote.Subtitle")
         };
+        _evernoteSubtitleLabel = subtitleLabel;
 
         var rootPathLayout = new TableLayoutPanel
         {
@@ -589,8 +615,9 @@ internal sealed partial class MainForm : Form
         {
             AutoSize = true,
             Margin = new Padding(8, 0, 0, 0),
-            Text = "Evernote Folder..."
+            Text = UiLanguageService.T("Evernote.FolderButton")
         };
+        _chooseEvernoteFolderButton = chooseRootFolderButton;
         chooseRootFolderButton.Click += (_, _) => ChooseEvernoteRootPath();
 
         rootPathLayout.Controls.Add(rootPathTextBox, 0, 0);
@@ -610,8 +637,9 @@ internal sealed partial class MainForm : Form
             Width = 90,
             Height = 30,
             Margin = new Padding(0, 0, 0, 0),
-            Text = "Reload"
+            Text = UiLanguageService.T("Evernote.Reload")
         };
+        _reloadEvernoteButton = reloadButton;
         reloadButton.Click += (_, _) => LoadEvernoteTreeFromConfiguredRoot(showErrors: true);
 
         var exportButton = new Button
@@ -620,8 +648,9 @@ internal sealed partial class MainForm : Form
             Width = 90,
             Height = 30,
             Margin = new Padding(8, 0, 0, 0),
-            Text = "Export"
+            Text = UiLanguageService.T("Evernote.Export")
         };
+        _exportEvernoteButton = exportButton;
         exportButton.Click += async (_, _) => await ExportSelectedEvernoteContentToMarkdownAsync(
             showDialogs: true,
             source: "manual",
@@ -653,9 +682,10 @@ internal sealed partial class MainForm : Form
         var pollFrequencyLabel = new Label
         {
             AutoSize = true,
-            Text = "Evernote polling frequency (minutes):",
+            Text = UiLanguageService.T("Evernote.PollFrequencyMinutes"),
             Anchor = AnchorStyles.Left
         };
+        _evernotePollFrequencyLabel = pollFrequencyLabel;
         var pollIntervalNumeric = new NumericUpDown
         {
             Width = 120,
@@ -681,7 +711,7 @@ internal sealed partial class MainForm : Form
         var pausePollingCheckBox = new CheckBox
         {
             AutoSize = true,
-            Text = "Pause automatic polling",
+            Text = UiLanguageService.T("Evernote.PauseAutomaticPolling"),
             Checked = _appState.EvernotePollingPaused,
             Anchor = AnchorStyles.Left
         };
@@ -709,7 +739,7 @@ internal sealed partial class MainForm : Form
         {
             AutoSize = true,
             ForeColor = Color.DarkRed,
-            Text = "Lock: (none)",
+            Text = UiLanguageService.T("Evernote.LockNone"),
             Anchor = AnchorStyles.Left
         };
 
@@ -717,7 +747,7 @@ internal sealed partial class MainForm : Form
         {
             Width = 82,
             Height = 28,
-            Text = "Force",
+            Text = UiLanguageService.T("Evernote.Force"),
             Anchor = AnchorStyles.Left
         };
         pollingForceLockButton.Click += async (_, _) => await HandleForcePollingLockFromUiAsync();
@@ -735,16 +765,17 @@ internal sealed partial class MainForm : Form
         {
             AutoSize = true,
             ForeColor = Color.DimGray,
-            Text = "State poll: every 6s, next in --s",
+            Text = UiLanguageService.T("Evernote.StatePollDefault"),
             Anchor = AnchorStyles.Left
         };
 
         var maxMarkdownLabel = new Label
         {
             AutoSize = true,
-            Text = "Keep last X markdown exports:",
+            Text = UiLanguageService.T("Evernote.KeepLastX"),
             Anchor = AnchorStyles.Left
         };
+        _evernoteMaxMarkdownLabel = maxMarkdownLabel;
         var maxMarkdownFilesNumeric = new NumericUpDown
         {
             Width = 120,
@@ -769,9 +800,10 @@ internal sealed partial class MainForm : Form
         var maxMarkdownHelpLabel = new Label
         {
             AutoSize = true,
-            Text = "Older files in ./markdown will be deleted automatically after each export.",
+            Text = UiLanguageService.T("Evernote.KeepLastXHelp"),
             Anchor = AnchorStyles.Left
         };
+        _evernoteMaxMarkdownHelpLabel = maxMarkdownHelpLabel;
 
         settingsLayout.Controls.Add(pausePollingCheckBox, 0, 0);
         settingsLayout.SetColumnSpan(pausePollingCheckBox, 2);
@@ -824,7 +856,7 @@ internal sealed partial class MainForm : Form
         {
             AutoSize = true,
             Margin = new Padding(0, 0, 0, 0),
-            Text = "No Evernote folder selected."
+            Text = UiLanguageService.T("Evernote.NoFolderSelected")
         };
         var statusPanel = new Panel
         {
@@ -848,7 +880,7 @@ internal sealed partial class MainForm : Form
         var showIgnoredCheckBox = new CheckBox
         {
             AutoSize = true,
-            Text = "Show ignored",
+            Text = UiLanguageService.T("Evernote.ShowIgnored"),
             Checked = _appState.EvernoteShowIgnoredItems,
             Anchor = AnchorStyles.Left
         };
@@ -863,12 +895,14 @@ internal sealed partial class MainForm : Form
             Margin = new Padding(0)
         };
         treeHeaderLeftLayout.Controls.Add(showIgnoredCheckBox);
-        treeHeaderLeftLayout.Controls.Add(new Label
+        var treeHintLabel = new Label
         {
             AutoSize = true,
             Margin = new Padding(8, 4, 0, 0),
-            Text = "Right-click: ignore or set export file name."
-        });
+            Text = UiLanguageService.T("Evernote.RightClickHint")
+        };
+        _evernoteTreeHintLabel = treeHintLabel;
+        treeHeaderLeftLayout.Controls.Add(treeHintLabel);
 
         treeHeaderLayout.Controls.Add(treeHeaderLeftLayout, 0, 0);
         treeHeaderLayout.Controls.Add(new Label { AutoSize = true, Text = string.Empty }, 1, 0);
@@ -919,6 +953,31 @@ internal sealed partial class MainForm : Form
             maxMarkdownFilesNumeric);
     }
 
+    private void ApplyLocalizedEvernoteExportText()
+    {
+        if (_evernoteTitleLabel is null)
+        {
+            return;
+        }
+
+        _evernoteTitleLabel.Text = UiLanguageService.T("Evernote.Title");
+        _evernoteSubtitleLabel.Text = UiLanguageService.T("Evernote.Subtitle");
+        _chooseEvernoteFolderButton.Text = UiLanguageService.T("Evernote.FolderButton");
+        _reloadEvernoteButton.Text = UiLanguageService.T("Evernote.Reload");
+        _exportEvernoteButton.Text = UiLanguageService.T("Evernote.Export");
+        _evernotePollFrequencyLabel.Text = UiLanguageService.T("Evernote.PollFrequencyMinutes");
+        _evernotePausePollingCheckBox.Text = UiLanguageService.T("Evernote.PauseAutomaticPolling");
+        _evernotePollingForceLockButton.Text = UiLanguageService.T("Evernote.Force");
+        _evernoteMaxMarkdownLabel.Text = UiLanguageService.T("Evernote.KeepLastX");
+        _evernoteMaxMarkdownHelpLabel.Text = UiLanguageService.T("Evernote.KeepLastXHelp");
+        _evernoteShowIgnoredCheckBox.Text = UiLanguageService.T("Evernote.ShowIgnored");
+        _evernoteTreeHintLabel.Text = UiLanguageService.T("Evernote.RightClickHint");
+        if (string.IsNullOrWhiteSpace(_evernoteStatusLabel.Text))
+        {
+            _evernoteStatusLabel.Text = UiLanguageService.T("Evernote.NoFolderSelected");
+        }
+    }
+
     private void EvernoteShowIgnoredCheckBox_CheckedChanged(object? sender, EventArgs e)
     {
         if (_syncingEvernoteShowIgnoredToggle)
@@ -943,7 +1002,7 @@ internal sealed partial class MainForm : Form
         var currentPath = GetConfiguredEvernoteRootPath();
         using var dialog = new FolderBrowserDialog
         {
-            Description = "Choose the root folder of the Evernote installation",
+            Description = UiLanguageService.T("Evernote.ChooseRootFolderDescription"),
             ShowNewFolderButton = false
         };
 
@@ -1001,7 +1060,7 @@ internal sealed partial class MainForm : Form
         if (string.IsNullOrWhiteSpace(rootPath))
         {
             PopulateEvernoteTree([]);
-            SetEvernoteStatus("No Evernote folder selected.");
+            SetEvernoteStatus(UiLanguageService.T("Evernote.NoFolderSelected"));
             return;
         }
 
@@ -1010,7 +1069,11 @@ internal sealed partial class MainForm : Form
             var stacks = _evernoteLocalDbService.GetStacksAndNotebooks(rootPath, out var dbPath);
             PopulateEvernoteTree(stacks);
             SetEvernoteStatus(
-                $"DB detected: {dbPath} | Stacks: {stacks.Count} | Notebooks: {stacks.Sum(stack => stack.Notebooks.Count)}");
+                UiLanguageService.Tf(
+                    "Evernote.DbDetected",
+                    dbPath,
+                    stacks.Count,
+                    stacks.Sum(stack => stack.Notebooks.Count)));
             if (refreshTracking)
             {
                 PollEvernoteTracking(allowAutoExport: false, showErrors: false, ignorePause: false);
@@ -1019,13 +1082,13 @@ internal sealed partial class MainForm : Form
         catch (Exception exception)
         {
             PopulateEvernoteTree([]);
-            SetEvernoteStatus($"DB error: {exception.Message}");
+            SetEvernoteStatus(UiLanguageService.Tf("Evernote.DbError", exception.Message));
             if (showErrors)
             {
                 MessageBox.Show(
                     this,
-                    $"Unable to read Evernote database.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
-                    "Evernote Export",
+                    UiLanguageService.Tf("Evernote.UnableToReadDatabase", exception.Message),
+                    UiLanguageService.T("App.EvernoteExport"),
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
             }
@@ -1146,11 +1209,15 @@ internal sealed partial class MainForm : Form
         bool ignored,
         string? exportFileName)
     {
-        var suffix = ignored ? " [ignored]" : string.Empty;
+        var suffix = ignored ? UiLanguageService.T("Evernote.Node.IgnoredSuffix") : string.Empty;
         var dateText = FormatEvernoteTimestamp(latestChangeMs);
-        var dateSuffix = string.IsNullOrWhiteSpace(dateText) ? string.Empty : $" | maj: {dateText}";
-        var exportSuffix = string.IsNullOrWhiteSpace(exportFileName) ? string.Empty : $" | export: {exportFileName}.md";
-        return $"{stackName} ({notebookCount} notebooks){exportSuffix}{dateSuffix}{suffix}";
+        var dateSuffix = string.IsNullOrWhiteSpace(dateText)
+            ? string.Empty
+            : UiLanguageService.Tf("Evernote.Node.UpdatedSuffix", dateText);
+        var exportSuffix = string.IsNullOrWhiteSpace(exportFileName)
+            ? string.Empty
+            : UiLanguageService.Tf("Evernote.Node.ExportSuffix", exportFileName);
+        return UiLanguageService.Tf("Evernote.Node.Stack", stackName, notebookCount, exportSuffix, dateSuffix, suffix);
     }
 
     private static string FormatNotebookNodeText(
@@ -1160,11 +1227,15 @@ internal sealed partial class MainForm : Form
         bool ignored,
         string? exportFileName)
     {
-        var suffix = ignored ? " [ignored]" : string.Empty;
+        var suffix = ignored ? UiLanguageService.T("Evernote.Node.IgnoredSuffix") : string.Empty;
         var dateText = FormatEvernoteTimestamp(latestChangeMs);
-        var dateSuffix = string.IsNullOrWhiteSpace(dateText) ? string.Empty : $" | maj: {dateText}";
-        var exportSuffix = string.IsNullOrWhiteSpace(exportFileName) ? string.Empty : $" | export: {exportFileName}.md";
-        return $"{notebookName} ({noteCount} notes){exportSuffix}{dateSuffix}{suffix}";
+        var dateSuffix = string.IsNullOrWhiteSpace(dateText)
+            ? string.Empty
+            : UiLanguageService.Tf("Evernote.Node.UpdatedSuffix", dateText);
+        var exportSuffix = string.IsNullOrWhiteSpace(exportFileName)
+            ? string.Empty
+            : UiLanguageService.Tf("Evernote.Node.ExportSuffix", exportFileName);
+        return UiLanguageService.Tf("Evernote.Node.Notebook", notebookName, noteCount, exportSuffix, dateSuffix, suffix);
     }
 
     private static string FormatEvernoteTimestamp(long? timestampMs)
@@ -1238,9 +1309,10 @@ internal sealed partial class MainForm : Form
         if (node?.Tag is not EvernoteTreeNodeTag tag)
         {
             _toggleIgnoreEvernoteNodeMenuItem.Enabled = false;
-            _toggleIgnoreEvernoteNodeMenuItem.Text = "Ignore";
+            _toggleIgnoreEvernoteNodeMenuItem.Text = UiLanguageService.T("Main.EvernoteMenu.Ignore");
             _setExportFileNameEvernoteNodeMenuItem.Enabled = false;
             _clearExportFileNameEvernoteNodeMenuItem.Enabled = false;
+            _clearExportFileNameEvernoteNodeMenuItem.Text = UiLanguageService.T("Main.EvernoteMenu.ClearExportFileName");
             return;
         }
 
@@ -1252,15 +1324,23 @@ internal sealed partial class MainForm : Form
             : _appState.GetEvernoteNotebookExportFileName(tag.Id);
 
         _toggleIgnoreEvernoteNodeMenuItem.Enabled = true;
+        var localizedKind = GetLocalizedEvernoteNodeKind(tag.Kind);
         _toggleIgnoreEvernoteNodeMenuItem.Text = ignored
-            ? $"Unignore {tag.Kind.ToString().ToLowerInvariant()}"
-            : $"Ignore {tag.Kind.ToString().ToLowerInvariant()}";
+            ? UiLanguageService.Tf("Main.EvernoteMenu.UnignoreKind", localizedKind)
+            : UiLanguageService.Tf("Main.EvernoteMenu.IgnoreKind", localizedKind);
         _setExportFileNameEvernoteNodeMenuItem.Enabled = true;
-        _setExportFileNameEvernoteNodeMenuItem.Text = $"Set export file for {tag.Kind.ToString().ToLowerInvariant()}...";
+        _setExportFileNameEvernoteNodeMenuItem.Text = UiLanguageService.Tf("Main.EvernoteMenu.SetExportFileForKind", localizedKind);
         _clearExportFileNameEvernoteNodeMenuItem.Enabled = !string.IsNullOrWhiteSpace(currentExportFileName);
         _clearExportFileNameEvernoteNodeMenuItem.Text = string.IsNullOrWhiteSpace(currentExportFileName)
-            ? "Clear export file name"
-            : $"Clear export file ({currentExportFileName})";
+            ? UiLanguageService.T("Main.EvernoteMenu.ClearExportFileName")
+            : UiLanguageService.Tf("Main.EvernoteMenu.ClearExportFileWithName", currentExportFileName ?? string.Empty);
+    }
+
+    private static string GetLocalizedEvernoteNodeKind(EvernoteTreeNodeKind kind)
+    {
+        return kind == EvernoteTreeNodeKind.Stack
+            ? UiLanguageService.T("Main.Evernote.Kind.Stack")
+            : UiLanguageService.T("Main.Evernote.Kind.Notebook");
     }
 
     private void ToggleIgnoreForContextNode()
@@ -1369,7 +1449,7 @@ internal sealed partial class MainForm : Form
     {
         using var dialog = new Form
         {
-            Text = "Export File Name",
+            Text = UiLanguageService.T("Evernote.ExportFileNameDialogTitle"),
             StartPosition = FormStartPosition.CenterParent,
             FormBorderStyle = FormBorderStyle.FixedDialog,
             MaximizeBox = false,
@@ -1384,7 +1464,7 @@ internal sealed partial class MainForm : Form
             Left = 12,
             Top = 12,
             Width = 480,
-            Text = $"Export file name for {containerName} (without .md):"
+            Text = UiLanguageService.Tf("Evernote.ExportFileNameDialogLabel", containerName)
         };
 
         var textBox = new TextBox
@@ -1400,12 +1480,12 @@ internal sealed partial class MainForm : Form
             Left = 12,
             Top = 66,
             Width = 480,
-            Text = "Le meme nom permet de grouper plusieurs stacks/notebooks."
+            Text = UiLanguageService.T("Evernote.ExportFileNameDialogHint")
         };
 
         var okButton = new Button
         {
-            Text = "Save",
+            Text = UiLanguageService.T("Common.Save"),
             Left = 326,
             Top = 98,
             Width = 80,
@@ -1414,7 +1494,7 @@ internal sealed partial class MainForm : Form
 
         var cancelButton = new Button
         {
-            Text = "Cancel",
+            Text = UiLanguageService.T("Common.Cancel"),
             Left = 412,
             Top = 98,
             Width = 80,
@@ -1439,8 +1519,8 @@ internal sealed partial class MainForm : Form
         {
             MessageBox.Show(
                 this,
-                "Nom invalide. Utilise au moins un caractere valide.",
-                "Evernote Export",
+                UiLanguageService.T("Evernote.InvalidExportFileName"),
+                UiLanguageService.T("App.EvernoteExport"),
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Warning);
             return null;
@@ -2744,20 +2824,25 @@ internal sealed partial class MainForm : Form
 
     private void UpdateEvernotePollingUiState()
     {
-        var owner = string.IsNullOrWhiteSpace(_lockOwnerDisplayName) ? "(none)" : _lockOwnerDisplayName;
+        var owner = string.IsNullOrWhiteSpace(_lockOwnerDisplayName)
+            ? UiLanguageService.T("Evernote.None")
+            : _lockOwnerDisplayName;
         var isLocalOwner = string.Equals(_lockOwnerInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase);
-        _evernotePollingLockOwnerLabel.Text = $"Lock: {owner}";
+        _evernotePollingLockOwnerLabel.Text = UiLanguageService.Tf("Evernote.LockOwner", owner);
         _evernotePollingLockOwnerLabel.ForeColor = isLocalOwner ? Color.DarkGreen : Color.DarkRed;
 
         var hasPending = !string.IsNullOrWhiteSpace(_pendingTakeoverTargetDisplayName);
         _evernotePollingPendingRequestLabel.Visible = hasPending;
         _evernotePollingPendingRequestLabel.Text = hasPending
-            ? $"awaiting confirmation from {_pendingTakeoverTargetDisplayName}"
+            ? UiLanguageService.Tf("Evernote.AwaitingConfirmationFrom", _pendingTakeoverTargetDisplayName ?? string.Empty)
             : string.Empty;
 
         var intervalSeconds = Math.Max(1, _pollingLockSyncTimer.Interval / 1000);
         var secondsUntilNextPoll = (int)Math.Ceiling((_nextPollingStateSyncAtUtc - DateTimeOffset.UtcNow).TotalSeconds);
-        _evernotePollingNextStatePollLabel.Text = $"State poll: every {intervalSeconds}s, next in {Math.Max(0, secondsUntilNextPoll)}s";
+        _evernotePollingNextStatePollLabel.Text = UiLanguageService.Tf(
+            "Evernote.StatePoll",
+            intervalSeconds,
+            Math.Max(0, secondsUntilNextPoll));
 
         var pauseBusy = _settingsPauseChangeInProgress || _distributedPollingSyncInProgress || _settingsForceLockInProgress;
         _evernotePausePollingCheckBox.Enabled = !pauseBusy && !_evernotePausePollingRequestInProgress && !hasPending;
@@ -3106,4 +3191,5 @@ internal sealed partial class MainForm : Form
         base.Dispose(disposing);
     }
 }
+
 

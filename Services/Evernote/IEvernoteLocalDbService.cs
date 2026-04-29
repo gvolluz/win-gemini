@@ -1,4 +1,4 @@
-namespace WinGeminiWrapper;
+﻿namespace WinGemini;
 
 internal interface IEvernoteLocalDbService
 {
@@ -12,3 +12,4 @@ internal interface IEvernoteLocalDbService
         string exportBackupsDirectory,
         int maxBackupsToKeep);
 }
+

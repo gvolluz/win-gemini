@@ -2,6 +2,12 @@
 
 A native Windows desktop app (`WinForms + WebView2`) that wraps multiple Google apps and includes an Evernote export workspace with optional Google Drive sync.
 
+**DISCLAIMER**
+1) This is initially a pure personal app, just for my own use case, but feel free to use it at your own risk
+2) It is "vibe" written *by* Codex, not a single line is my own (apart maybe this disclaimer :D); I do not write C# code myself, but I'm nonetheless a fullstack dev, so it should be not that bad... I just didn't want to learn C#
+3) Translations have been done by Codex 5.3 in April 2026, so quality is what it is (no, I do not natively speak Russian... or even 95% of the other languages supported :D)
+4) Feel free to pull request if you have improvements, especially in the translations (sub-disclaimer: if any translation is absolute BS or even worse, insulting: feel free to blame Codex :P)
+
 ## Wrapped apps
 
 The top switcher lets you move between:
@@ -63,11 +69,11 @@ The app supports Google OAuth and Drive sync features:
 ## Local storage
 
 - WebView profile/session data:
-  - `%LOCALAPPDATA%\WinGeminiWrapper\WebView2`
+  - `%LOCALAPPDATA%\WinGemini\WebView2`
 - Local app config/state:
-  - `%LOCALAPPDATA%\WinGeminiWrapper\local-config.json`
+  - `%LOCALAPPDATA%\WinGemini\local-config.json`
 - Legacy state path still supported for migration:
-  - `%LOCALAPPDATA%\WinGeminiWrapper\app-state.json`
+  - `%LOCALAPPDATA%\WinGemini\app-state.json`
 
 ## Prerequisites
 
@@ -90,7 +96,7 @@ dotnet run
 
 Outputs:
 
-- App EXE (single-file): `artifacts\publish\win-x64\WinGeminiWrapper.exe`
+- App EXE (single-file): `artifacts\publish\win-x64\WinGemini.exe`
 - Installer EXE: `artifacts\installer\WinGeminiSetup-<version>-win-x64.exe`
 
 The setup EXE stays small by not bundling runtimes.

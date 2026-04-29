@@ -1,4 +1,4 @@
-namespace WinGeminiWrapper;
+﻿namespace WinGemini;
 
 internal interface IEvernoteChangeDetectionService
 {
@@ -11,3 +11,4 @@ internal interface IEvernoteChangeDetectionService
 internal sealed record EvernoteNotebookChangeSummary(
     int NoteChangeCount,
     IReadOnlySet<string> ChangedNotebookIds);
+

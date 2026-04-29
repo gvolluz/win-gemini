@@ -1,4 +1,4 @@
-namespace WinGeminiWrapper;
+﻿namespace WinGemini;
 
 internal interface IGoogleDriveSyncService
 {
@@ -34,3 +34,4 @@ internal interface IGoogleDriveSyncService
         CancellationToken cancellationToken);
     Task<GoogleDrivePollingStateDeleteResult> DeleteAllPollingStatesAsync(AppState state, CancellationToken cancellationToken);
 }
+
