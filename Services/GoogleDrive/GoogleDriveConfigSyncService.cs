@@ -1,6 +1,6 @@
-using Google.Apis.Drive.v3;
+﻿using Google.Apis.Drive.v3;
 
-namespace WinGeminiWrapper;
+namespace WinGemini;
 
 internal static partial class GoogleDriveConfigSyncService
 {
@@ -29,3 +29,4 @@ internal static partial class GoogleDriveConfigSyncService
         return value.Replace("\\", "\\\\").Replace("'", "\\'");
     }
 }
+

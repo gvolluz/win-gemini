@@ -1,11 +1,11 @@
-using System.Net;
+﻿using System.Net;
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
 using Microsoft.Data.Sqlite;
 
-namespace WinGeminiWrapper;
+namespace WinGemini;
 
 internal static partial class EvernoteLocalDbService
 {
@@ -32,40 +32,12 @@ internal static partial class EvernoteLocalDbService
     private static readonly Regex MarkdownListMarkerRegex = new(
         @"^[ \t]{0,3}(?:[-+*]|\d+\.)\s+",
         RegexOptions.Compiled);
-    private static readonly Regex RteDocHeadingStyleRegex = new(
-        @"h(?<lvl>[1-6])\s+(?<txt>[^!\r\n]{2,180})!\s*style",
-        RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    private static readonly Regex RteDocHeadingParenRegex = new(
-        @"h(?<lvl>[1-6])\s+(?<txt>[^\(\r\n]{2,180})\(\s*style",
-        RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex NonWordCollapseRegex = new(
         @"[^\p{L}\p{Nd}]+",
         RegexOptions.Compiled);
     private static readonly Regex UuidRegex = new(
         @"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
         RegexOptions.Compiled);
-    private static readonly HashSet<string> EnmlBlockTags =
-    [
-        "en-note",
-        "div",
-        "p",
-        "ul",
-        "ol",
-        "li",
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "h5",
-        "h6",
-        "pre",
-        "table",
-        "tr",
-        "td",
-        "th",
-        "hr",
-        "blockquote"
-    ];
     private static readonly HashSet<string> EnmlSkipTags = ["en-media", "img"];
     private static readonly HashSet<string> RteDocListStopTokens = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -382,112 +354,6 @@ internal static partial class EvernoteLocalDbService
             deletedFiles);
     }
 
-    internal static EvernoteSingleNoteDiagnosticResult ExportSingleNoteDiagnostic(
-        string evernoteRootPath,
-        string noteGuid,
-        string outputDirectory)
-    {
-        if (string.IsNullOrWhiteSpace(noteGuid))
-        {
-            throw new InvalidOperationException("Identifiant de note invalide.");
-        }
-
-        var normalizedNoteGuid = noteGuid.Trim();
-        var resolvedDatabasePath = ResolveLatestDatabasePath(evernoteRootPath);
-
-        using var connection = OpenReadOnlyConnection(resolvedDatabasePath);
-        connection.Open();
-
-        using var command = connection.CreateCommand();
-        var contentSqlExpression = BuildNoteContentSqlExpression(connection);
-        command.CommandText = $"""
-                              SELECT
-                                  n.id AS note_guid,
-                                  COALESCE(n.label, 'Sans titre') AS note_title,
-                                  n.created AS note_created,
-                                  n.updated AS note_updated,
-                                  nb.id AS notebook_id,
-                                  COALESCE(nb.label, 'Sans carnet') AS notebook_label,
-                                  COALESCE(nb.personal_Stack_id, '{MissingStackLabel}') AS stack_id,
-                                  {contentSqlExpression} AS content
-                              FROM Nodes_Note n
-                              JOIN Nodes_Notebook nb ON nb.id = n.parent_Notebook_id
-                              LEFT JOIN Offline_Search_Note_Content c ON c.id = n.id
-                              WHERE n.deleted IS NULL
-                                AND LOWER(n.id) = LOWER($noteGuid)
-                              LIMIT 1
-                              """;
-        command.Parameters.AddWithValue("$noteGuid", normalizedNoteGuid);
-
-        EvernoteExportNoteRow? note = null;
-        using (var reader = command.ExecuteReader())
-        {
-            if (reader.Read())
-            {
-                note = new EvernoteExportNoteRow(
-                    ReadRequiredString(reader, "stack_id"),
-                    ReadRequiredString(reader, "notebook_id"),
-                    ReadRequiredString(reader, "notebook_label"),
-                    ReadRequiredString(reader, "note_guid"),
-                    ReadRequiredString(reader, "note_title"),
-                    ReadNullableInt64(reader, "note_created"),
-                    ReadNullableInt64(reader, "note_updated"),
-                    ReadRequiredString(reader, "content"));
-            }
-        }
-
-        if (note is null)
-        {
-            throw new InvalidOperationException($"Note introuvable pour l'id: {normalizedNoteGuid}");
-        }
-
-        Directory.CreateDirectory(outputDirectory);
-        var safeTitle = SanitizeExportFileBaseName(note.NoteTitle);
-        if (string.IsNullOrWhiteSpace(safeTitle))
-        {
-            safeTitle = "note";
-        }
-
-        var safeGuid = SanitizeExportFileBaseName(note.NoteGuid);
-        var fileBaseName = $"{safeTitle}_{safeGuid}_diag";
-
-        var rawEnmlPath = Path.Combine(outputDirectory, $"{fileBaseName}.enml.txt");
-        var markdownPath = Path.Combine(outputDirectory, $"{fileBaseName}.md");
-        var structurePath = Path.Combine(outputDirectory, $"{fileBaseName}.structure.txt");
-
-        File.WriteAllText(rawEnmlPath, note.Content ?? string.Empty, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-
-        var noteTitle = NormalizeNoteTitleForHeading(note.NoteTitle);
-        var rawContent = note.Content ?? string.Empty;
-        var body = ConvertEvernoteContentToMarkdown(rawContent, evernoteRootPath, note.NoteGuid);
-        body = NormalizeEvernoteInternalLinks(body);
-        body = PromoteMarkdownHeadingLevels(body, levelIncrement: 1);
-
-        var markdownBuilder = new StringBuilder();
-        markdownBuilder.AppendLine($"# {noteTitle}");
-        markdownBuilder.AppendLine();
-        markdownBuilder.AppendLine(
-            $"{note.NoteGuid} | created: {FormatMsTimestamp(note.CreatedMs)} | updated: {FormatMsTimestamp(note.UpdatedMs)}");
-        markdownBuilder.AppendLine();
-        markdownBuilder.AppendLine(string.IsNullOrWhiteSpace(body) ? "_(contenu hors cache local)_" : body);
-        markdownBuilder.AppendLine();
-        File.WriteAllText(markdownPath, markdownBuilder.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-
-        var structureDump = BuildEnmlStructureDump(rawContent);
-        File.WriteAllText(structurePath, structureDump, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-
-        return new EvernoteSingleNoteDiagnosticResult(
-            note.NoteGuid,
-            note.NoteTitle,
-            note.NotebookId,
-            note.NotebookName,
-            note.StackId,
-            resolvedDatabasePath,
-            rawEnmlPath,
-            markdownPath,
-            structurePath);
-    }
-
 }
 
 internal sealed record EvernoteStackInfo(
@@ -513,17 +379,6 @@ internal sealed record EvernoteMarkdownExportResult(
     string DatabasePath,
     int DeletedBackupFiles);
 
-internal sealed record EvernoteSingleNoteDiagnosticResult(
-    string NoteGuid,
-    string NoteTitle,
-    string NotebookId,
-    string NotebookName,
-    string StackId,
-    string DatabasePath,
-    string RawEnmlPath,
-    string MarkdownPath,
-    string StructureDumpPath);
-
 internal sealed record EvernoteExportNoteRow(
     string StackId,
     string NotebookId,
@@ -543,4 +398,5 @@ internal sealed record RteListHint(
     bool IsOrdered,
     string Text,
     string NormalizedText);
+
 

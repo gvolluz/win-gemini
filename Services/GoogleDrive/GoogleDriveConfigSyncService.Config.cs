@@ -1,8 +1,8 @@
-using System.Text;
+﻿using System.Text;
 using Google;
 using Google.Apis.Drive.v3;
 
-namespace WinGeminiWrapper;
+namespace WinGemini;
 
 internal static partial class GoogleDriveConfigSyncService
 {
@@ -249,3 +249,4 @@ internal static partial class GoogleDriveConfigSyncService
         return created.Id;
     }
 }
+

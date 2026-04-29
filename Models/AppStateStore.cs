@@ -1,7 +1,7 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Text.Json.Serialization;
 
-namespace WinGeminiWrapper;
+namespace WinGemini;
 
 internal sealed class AppState
 {
@@ -64,6 +64,12 @@ internal sealed class AppState
 
     [JsonInclude]
     internal bool GoogleDriveAutoRestoreOnStartup { get; set; }
+
+    [JsonInclude]
+    internal bool EnableDebugLogs { get; set; }
+
+    [JsonInclude]
+    internal string? UiLanguageCode { get; set; }
 
     [JsonInclude]
     internal string? GoogleDriveClientId { get; set; }
@@ -240,6 +246,7 @@ internal sealed class AppState
         GoogleDriveClientId = NormalizeOptionalString(GoogleDriveClientId);
         GoogleDriveClientSecret = NormalizeOptionalString(GoogleDriveClientSecret);
         GoogleDriveConfigFileId = NormalizeOptionalString(GoogleDriveConfigFileId);
+        UiLanguageCode = NormalizeUiLanguageCode(UiLanguageCode);
     }
 
     private static void UpdateEvernoteSelectionList(List<string> target, string id, bool isSelected)
@@ -420,6 +427,21 @@ internal sealed class AppState
 
         return value.Trim();
     }
+
+    private static string? NormalizeUiLanguageCode(string? value)
+    {
+        var normalized = NormalizeOptionalString(value);
+        if (string.IsNullOrWhiteSpace(normalized) ||
+            string.Equals(normalized, UiLanguageCatalog.AutoLanguageCode, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        return UiLanguageCatalog.SupportedLanguageCodes.Any(code =>
+            string.Equals(code, normalized, StringComparison.OrdinalIgnoreCase))
+            ? normalized
+            : null;
+    }
 }
 
 internal static class AppStateStore
@@ -550,3 +572,4 @@ internal sealed class EvernoteExportFileAssignmentState
     [JsonInclude]
     internal string ExportFileName { get; set; } = string.Empty;
 }
+

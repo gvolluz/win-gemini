@@ -1,6 +1,6 @@
-using System.Text;
+﻿using System.Text;
 
-namespace WinGeminiWrapper;
+namespace WinGemini;
 
 internal static class AppLogger
 {
@@ -9,10 +9,23 @@ internal static class AppLogger
     private static readonly string LogFilePath = Path.Combine(
         LogsDirectoryPath,
         $"wingemini-{DateTime.Now:yyyyMMdd}.log");
+    private static bool _debugLoggingEnabled;
 
-    internal static void Info(string message)
+    internal static bool IsDebugLoggingEnabled => _debugLoggingEnabled;
+
+    internal static void SetDebugLoggingEnabled(bool enabled)
     {
-        Write("INFO", message, null);
+        _debugLoggingEnabled = enabled;
+    }
+
+    internal static void Debug(string message)
+    {
+        if (!_debugLoggingEnabled)
+        {
+            return;
+        }
+
+        Write("DEBUG", message, null);
     }
 
     internal static void Error(string message, Exception? exception = null)
@@ -34,10 +47,12 @@ internal static class AppLogger
                 builder.Append(exception);
             }
 
-            var line = builder.ToString() + Environment.NewLine;
+            var line = builder.ToString();
             lock (Sync)
             {
-                File.AppendAllText(LogFilePath, line, Encoding.UTF8);
+                Console.WriteLine(line);
+                Directory.CreateDirectory(LogsDirectoryPath);
+                File.AppendAllText(LogFilePath, line + Environment.NewLine, Encoding.UTF8);
             }
         }
         catch
@@ -46,3 +61,4 @@ internal static class AppLogger
         }
     }
 }
+

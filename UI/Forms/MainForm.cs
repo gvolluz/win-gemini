@@ -1,10 +1,10 @@
-using Microsoft.Web.WebView2.Core;
+﻿using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 using System.Security.Cryptography;
 
-namespace WinGeminiWrapper;
+namespace WinGemini;
 
-internal sealed class MainForm : Form
+internal sealed partial class MainForm : Form
 {
     private const int TopRevealThresholdPixels = 8;
     private const int WindowStateSaveDebounceMs = 350;
@@ -23,11 +23,30 @@ internal sealed class MainForm : Form
     private readonly ContextMenuStrip _trayMenu;
     private readonly NotifyIcon _trayIcon;
     private readonly ContextMenuStrip _evernoteTreeNodeMenu;
+    private readonly IGoogleDriveSyncService _googleDriveSyncService;
+    private readonly IEvernoteLocalDbService _evernoteLocalDbService;
+    private readonly IEvernoteChangeDetectionService _evernoteChangeDetectionService;
     private readonly TextBox _evernoteDbPathTextBox;
     private readonly TreeView _evernoteTreeView;
     private readonly Label _evernoteStatusLabel;
     private readonly CheckBox _evernoteShowIgnoredCheckBox;
     private readonly ProgressBar _evernoteExportProgressBar;
+    private readonly NumericUpDown _evernotePollingIntervalMinutesNumeric;
+    private readonly CheckBox _evernotePausePollingCheckBox;
+    private readonly Label _evernotePollingLockOwnerLabel;
+    private readonly Button _evernotePollingForceLockButton;
+    private readonly Label _evernotePollingPendingRequestLabel;
+    private readonly Label _evernotePollingNextStatePollLabel;
+    private readonly NumericUpDown _evernoteMaxMarkdownFilesNumeric;
+    private Label _evernoteTitleLabel = null!;
+    private Label _evernoteSubtitleLabel = null!;
+    private Button _chooseEvernoteFolderButton = null!;
+    private Button _reloadEvernoteButton = null!;
+    private Button _exportEvernoteButton = null!;
+    private Label _evernotePollFrequencyLabel = null!;
+    private Label _evernoteMaxMarkdownLabel = null!;
+    private Label _evernoteMaxMarkdownHelpLabel = null!;
+    private Label _evernoteTreeHintLabel = null!;
     private readonly SemaphoreSlim _evernoteExportSemaphore = new(1, 1);
     private readonly Dictionary<WrappedApp, WebView2> _webViews = new();
     private readonly System.Windows.Forms.Timer _windowStateSaveTimer;
@@ -40,6 +59,14 @@ internal sealed class MainForm : Form
     private CoreWebView2Environment? _webViewEnvironment;
     private AppState _appState;
     private ToolStripMenuItem _switchAppMenuItem = null!;
+    private ToolStripLabel _appTopBarLabel = null!;
+    private ToolStripButton _refreshTopBarButton = null!;
+    private ToolStripButton _settingsTopBarButton = null!;
+    private ToolStripButton _logoutTopBarButton = null!;
+    private ToolStripMenuItem _refreshTrayMenuItem = null!;
+    private ToolStripMenuItem _settingsTrayMenuItem = null!;
+    private ToolStripMenuItem _logoutTrayMenuItem = null!;
+    private ToolStripMenuItem _exitTrayMenuItem = null!;
     private ToolStripMenuItem _toggleIgnoreEvernoteNodeMenuItem = null!;
     private ToolStripMenuItem _setExportFileNameEvernoteNodeMenuItem = null!;
     private ToolStripMenuItem _clearExportFileNameEvernoteNodeMenuItem = null!;
@@ -52,6 +79,8 @@ internal sealed class MainForm : Form
     private bool _googleDriveSyncInProgress;
     private bool _suspendGoogleDriveSyncQueue;
     private bool _syncingEvernoteShowIgnoredToggle;
+    private bool _syncingEvernotePausePollingToggle;
+    private bool _evernotePausePollingRequestInProgress;
     private bool _exitRequested;
     private bool _balloonShown;
     private bool _logoutInProgress;
@@ -81,9 +110,15 @@ internal sealed class MainForm : Form
     private DateTimeOffset _lastLocalPollingStateWriteUtc = DateTimeOffset.MinValue;
     private string? _lastLocalPollingStateSignature;
 
-    internal MainForm()
+    internal MainForm(
+        IGoogleDriveSyncService? googleDriveSyncService = null,
+        IEvernoteLocalDbService? evernoteLocalDbService = null,
+        IEvernoteChangeDetectionService? evernoteChangeDetectionService = null)
     {
-        AppLogger.Info("MainForm constructor started.");
+        AppLogger.Debug("MainForm constructor started.");
+        _googleDriveSyncService = googleDriveSyncService ?? GoogleDriveSyncServiceAdapter.Instance;
+        _evernoteLocalDbService = evernoteLocalDbService ?? EvernoteLocalDbServiceAdapter.Instance;
+        _evernoteChangeDetectionService = evernoteChangeDetectionService ?? EvernoteChangeDetectionService.Instance;
         _localMachineHostName = NormalizeHostName(Environment.MachineName);
         _localMachineInstanceSuffix = BuildStableInstanceSuffix();
         _localMachineInstanceId = $"{_localMachineHostName}:{_localMachineInstanceSuffix}";
@@ -92,6 +127,7 @@ internal sealed class MainForm : Form
         _localMachineStateFileName = _localMachineDefaultStateFileName;
         _appState = AppStateStore.Load();
         _appState.Normalize();
+        AppLogger.SetDebugLoggingEnabled(_appState.EnableDebugLogs);
         // Do not trust local PauseAutomaticPolling at startup; Drive state is source of truth.
         _appState.EvernotePollingPaused = true;
         _currentApp = Enum.IsDefined(typeof(WrappedApp), _appState.LastSelectedApp)
@@ -118,7 +154,14 @@ internal sealed class MainForm : Form
             _evernoteTreeView,
             _evernoteStatusLabel,
             _evernoteShowIgnoredCheckBox,
-            _evernoteExportProgressBar) = BuildEvernoteExportPanel();
+            _evernoteExportProgressBar,
+            _evernotePollingIntervalMinutesNumeric,
+            _evernotePausePollingCheckBox,
+            _evernotePollingLockOwnerLabel,
+            _evernotePollingForceLockButton,
+            _evernotePollingPendingRequestLabel,
+            _evernotePollingNextStatePollLabel,
+            _evernoteMaxMarkdownFilesNumeric) = BuildEvernoteExportPanel();
         _webViewHost.Controls.Add(_evernoteExportPanel);
 
         Controls.Add(_webViewHost);
@@ -132,7 +175,7 @@ internal sealed class MainForm : Form
             ContextMenuStrip = _trayMenu,
             Visible = true
         };
-        AppLogger.Info("Tray icon initialized.");
+        AppLogger.Debug("Tray icon initialized.");
         _trayIcon.MouseClick += TrayIcon_MouseClick;
 
         _windowStateSaveTimer = new System.Windows.Forms.Timer
@@ -167,21 +210,21 @@ internal sealed class MainForm : Form
         {
             Interval = 1000
         };
-        _settingsUiRefreshTimer.Tick += (_, _) => UpdateSettingsLockStatus();
+        _settingsUiRefreshTimer.Tick += (_, _) => UpdateEvernotePollingUiState();
 
         _traySyncAnimationTimer = new System.Windows.Forms.Timer
         {
             Interval = TraySyncAnimationIntervalMs
         };
         _traySyncAnimationTimer.Tick += TraySyncAnimationTimer_Tick;
-        AppLogger.Info("Tray animation timer initialized.");
+        AppLogger.Debug("Tray animation timer initialized.");
 
-        AppLogger.Info("Applying Evernote polling settings.");
+        AppLogger.Debug("Applying Evernote polling settings.");
         ApplyEvernotePollingSettings();
 
         UpdateAppChrome();
         RefreshTrayPollingIconState();
-        AppLogger.Info("MainForm constructor completed.");
+        AppLogger.Debug("MainForm constructor completed.");
 
         Load += MainForm_Load;
         Shown += MainForm_Shown;
@@ -253,10 +296,10 @@ internal sealed class MainForm : Form
     private async Task TryAutoRestoreConfigFromGoogleDriveAsync()
     {
         var hasLocalConfigFile = File.Exists(AppConfig.LocalConfigFilePath) || File.Exists(AppConfig.LegacyStateFilePath);
-        if (!GoogleDriveConfigSyncService.IsConfigured(_appState) &&
+        if (!_googleDriveSyncService.IsConfigured(_appState) &&
             TryAttachGoogleDriveCredentialsFromDefaultFile(out var loadedPath))
         {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive OAuth client loaded from: {loadedPath}");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Google Drive OAuth client loaded from: {loadedPath}");
             if (!hasLocalConfigFile)
             {
                 _appState.GoogleDriveSyncEnabled = true;
@@ -265,30 +308,30 @@ internal sealed class MainForm : Form
         }
 
         var shouldAttemptAutoRestore = _appState.GoogleDriveAutoRestoreOnStartup || !hasLocalConfigFile;
-        if (!shouldAttemptAutoRestore || !GoogleDriveConfigSyncService.IsConfigured(_appState))
+        if (!shouldAttemptAutoRestore || !_googleDriveSyncService.IsConfigured(_appState))
         {
             return;
         }
 
         var localFallbackState = _appState;
 
-        var downloadResult = await GoogleDriveConfigSyncService.DownloadConfigAsync(_appState, CancellationToken.None);
+        var downloadResult = await _googleDriveSyncService.DownloadConfigAsync(_appState, CancellationToken.None);
         if (downloadResult.IsNotFound)
         {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive config auto-restore: no remote config found.");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Google Drive config auto-restore: no remote config found.");
             return;
         }
 
         if (!downloadResult.IsSuccess)
         {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive config auto-restore failed: {downloadResult.Error}");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Google Drive config auto-restore failed: {downloadResult.Error}");
             return;
         }
 
         if (string.IsNullOrWhiteSpace(downloadResult.ConfigJson) ||
             !AppStateStore.TryDeserialize(downloadResult.ConfigJson, out var remoteState))
         {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive config auto-restore skipped: invalid remote JSON.");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Google Drive config auto-restore skipped: invalid remote JSON.");
             return;
         }
 
@@ -326,19 +369,19 @@ internal sealed class MainForm : Form
         }
 
         var modifiedInfo = downloadResult.ModifiedTimeUtc?.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") ?? "unknown";
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Config restored from Google Drive (modified: {modifiedInfo}).");
+        AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Config restored from Google Drive (modified: {modifiedInfo}).");
     }
 
     private bool TryAttachGoogleDriveCredentialsFromDefaultFile(out string sourcePath)
     {
         sourcePath = string.Empty;
-        if (!GoogleDriveConfigSyncService.TryLoadClientSecretsFromDefaultLocations(
+        if (!_googleDriveSyncService.TryLoadClientSecretsFromDefaultLocations(
                 out var clientId,
                 out var clientSecret,
                 out sourcePath,
                 out var error))
         {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive OAuth client not available: {error}");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Google Drive OAuth client not available: {error}");
             return false;
         }
 
@@ -447,17 +490,20 @@ internal sealed class MainForm : Form
             GripStyle = ToolStripGripStyle.Hidden,
             RenderMode = ToolStripRenderMode.System
         };
-        var logoutButton = new ToolStripButton("Log out", null, async (_, _) => await LogoutAsync())
+        _logoutTopBarButton = new ToolStripButton(UiLanguageService.T("Main.TopBar.LogOut"), null, async (_, _) => await LogoutAsync())
         {
             Alignment = ToolStripItemAlignment.Right
         };
+        _appTopBarLabel = new ToolStripLabel(UiLanguageService.T("Main.TopBar.App"));
+        _refreshTopBarButton = new ToolStripButton(UiLanguageService.T("Main.TopBar.Refresh"), null, (_, _) => RefreshCurrentApp());
+        _settingsTopBarButton = new ToolStripButton(UiLanguageService.T("Common.Settings"), null, (_, _) => OpenSettings());
 
-        topBar.Items.Add(new ToolStripLabel("App:"));
+        topBar.Items.Add(_appTopBarLabel);
         topBar.Items.Add(_appSwitcher);
         topBar.Items.Add(new ToolStripSeparator());
-        topBar.Items.Add(new ToolStripButton("Refresh", null, (_, _) => RefreshCurrentApp()));
-        topBar.Items.Add(new ToolStripButton("Settings", null, (_, _) => OpenSettings()));
-        topBar.Items.Add(logoutButton);
+        topBar.Items.Add(_refreshTopBarButton);
+        topBar.Items.Add(_settingsTopBarButton);
+        topBar.Items.Add(_logoutTopBarButton);
 
         return topBar;
     }
@@ -465,14 +511,18 @@ internal sealed class MainForm : Form
     private ContextMenuStrip BuildTrayMenu()
     {
         var menu = new ContextMenuStrip();
-        _switchAppMenuItem = new ToolStripMenuItem("Switch to");
+        _switchAppMenuItem = new ToolStripMenuItem(UiLanguageService.T("Main.Tray.SwitchTo"));
+        _refreshTrayMenuItem = new ToolStripMenuItem(UiLanguageService.T("Main.TopBar.Refresh"), null, (_, _) => RefreshCurrentApp());
+        _settingsTrayMenuItem = new ToolStripMenuItem(UiLanguageService.T("Common.Settings"), null, (_, _) => OpenSettings());
+        _logoutTrayMenuItem = new ToolStripMenuItem(UiLanguageService.T("Main.TopBar.LogOut"), null, async (_, _) => await LogoutAsync());
+        _exitTrayMenuItem = new ToolStripMenuItem(UiLanguageService.T("Main.Tray.Exit"), null, (_, _) => ExitApplication());
         menu.Opening += (_, _) => UpdateTrayMenuItems();
 
         menu.Items.Add(_switchAppMenuItem);
-        menu.Items.Add("Refresh", null, (_, _) => RefreshCurrentApp());
-        menu.Items.Add("Settings", null, (_, _) => OpenSettings());
-        menu.Items.Add("Log out", null, async (_, _) => await LogoutAsync());
-        menu.Items.Add("Exit", null, (_, _) => ExitApplication());
+        menu.Items.Add(_refreshTrayMenuItem);
+        menu.Items.Add(_settingsTrayMenuItem);
+        menu.Items.Add(_logoutTrayMenuItem);
+        menu.Items.Add(_exitTrayMenuItem);
         UpdateTrayMenuItems();
 
         return menu;
@@ -481,11 +531,11 @@ internal sealed class MainForm : Form
     private ContextMenuStrip BuildEvernoteTreeNodeMenu()
     {
         var menu = new ContextMenuStrip();
-        _toggleIgnoreEvernoteNodeMenuItem = new ToolStripMenuItem("Ignore");
+        _toggleIgnoreEvernoteNodeMenuItem = new ToolStripMenuItem(UiLanguageService.T("Main.EvernoteMenu.Ignore"));
         _toggleIgnoreEvernoteNodeMenuItem.Click += (_, _) => ToggleIgnoreForContextNode();
-        _setExportFileNameEvernoteNodeMenuItem = new ToolStripMenuItem("Set export file name...");
+        _setExportFileNameEvernoteNodeMenuItem = new ToolStripMenuItem(UiLanguageService.Tf("Main.EvernoteMenu.SetExportFileForKind", UiLanguageService.T("Main.Evernote.Kind.Notebook")));
         _setExportFileNameEvernoteNodeMenuItem.Click += (_, _) => SetExportFileNameForContextNode();
-        _clearExportFileNameEvernoteNodeMenuItem = new ToolStripMenuItem("Clear export file name");
+        _clearExportFileNameEvernoteNodeMenuItem = new ToolStripMenuItem(UiLanguageService.T("Main.EvernoteMenu.ClearExportFileName"));
         _clearExportFileNameEvernoteNodeMenuItem.Click += (_, _) => ClearExportFileNameForContextNode();
         menu.Items.Add(_toggleIgnoreEvernoteNodeMenuItem);
         menu.Items.Add(new ToolStripSeparator());
@@ -501,7 +551,14 @@ internal sealed class MainForm : Form
         TreeView TreeView,
         Label StatusLabel,
         CheckBox ShowIgnoredCheckBox,
-        ProgressBar ExportProgressBar) BuildEvernoteExportPanel()
+        ProgressBar ExportProgressBar,
+        NumericUpDown PollIntervalNumeric,
+        CheckBox PausePollingCheckBox,
+        Label PollingLockOwnerLabel,
+        Button PollingForceLockButton,
+        Label PollingPendingRequestLabel,
+        Label PollingNextStatePollLabel,
+        NumericUpDown MaxMarkdownFilesNumeric) BuildEvernoteExportPanel()
     {
         var container = new Panel
         {
@@ -513,37 +570,37 @@ internal sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 8,
+            RowCount = 5,
             Padding = new Padding(16)
         };
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         var titleLabel = new Label
         {
             AutoSize = true,
             Font = new Font(Font, FontStyle.Bold),
-            Text = "Evernote Export"
+            Text = UiLanguageService.T("Evernote.Title")
         };
+        _evernoteTitleLabel = titleLabel;
 
         var subtitleLabel = new Label
         {
             AutoSize = true,
-            Margin = new Padding(0, 8, 0, 12),
-            Text = "Selectionne le dossier racine Evernote, puis exporte les notebooks coches. Clic droit: ignorer ou definir le nom de fichier d'export."
+            Margin = new Padding(0, 8, 0, 8),
+            Text = UiLanguageService.T("Evernote.Subtitle")
         };
+        _evernoteSubtitleLabel = subtitleLabel;
 
         var rootPathLayout = new TableLayoutPanel
         {
             Dock = DockStyle.Top,
             ColumnCount = 2,
-            AutoSize = true
+            AutoSize = true,
+            MaximumSize = new Size(520, 0)
         };
         rootPathLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         rootPathLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -558,8 +615,9 @@ internal sealed class MainForm : Form
         {
             AutoSize = true,
             Margin = new Padding(8, 0, 0, 0),
-            Text = "Dossier Evernote..."
+            Text = UiLanguageService.T("Evernote.FolderButton")
         };
+        _chooseEvernoteFolderButton = chooseRootFolderButton;
         chooseRootFolderButton.Click += (_, _) => ChooseEvernoteRootPath();
 
         rootPathLayout.Controls.Add(rootPathTextBox, 0, 0);
@@ -570,22 +628,29 @@ internal sealed class MainForm : Form
             AutoSize = true,
             FlowDirection = FlowDirection.LeftToRight,
             WrapContents = false,
-            Margin = new Padding(0, 10, 0, 0)
+            Margin = new Padding(0, 8, 0, 0)
         };
 
         var reloadButton = new Button
         {
-            AutoSize = true,
-            Text = "Recharger"
+            AutoSize = false,
+            Width = 90,
+            Height = 30,
+            Margin = new Padding(0, 0, 0, 0),
+            Text = UiLanguageService.T("Evernote.Reload")
         };
+        _reloadEvernoteButton = reloadButton;
         reloadButton.Click += (_, _) => LoadEvernoteTreeFromConfiguredRoot(showErrors: true);
 
         var exportButton = new Button
         {
-            AutoSize = true,
+            AutoSize = false,
+            Width = 90,
+            Height = 30,
             Margin = new Padding(8, 0, 0, 0),
-            Text = "Export"
+            Text = UiLanguageService.T("Evernote.Export")
         };
+        _exportEvernoteButton = exportButton;
         exportButton.Click += async (_, _) => await ExportSelectedEvernoteContentToMarkdownAsync(
             showDialogs: true,
             source: "manual",
@@ -594,12 +659,213 @@ internal sealed class MainForm : Form
         actionsLayout.Controls.Add(reloadButton);
         actionsLayout.Controls.Add(exportButton);
 
+        var settingsLayout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 5,
+            RowCount = 6,
+            AutoSize = true,
+            Margin = new Padding(0)
+        };
+        settingsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        settingsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        settingsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        settingsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        settingsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        settingsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        settingsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        settingsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        settingsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        settingsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        settingsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        var pollFrequencyLabel = new Label
+        {
+            AutoSize = true,
+            Text = UiLanguageService.T("Evernote.PollFrequencyMinutes"),
+            Anchor = AnchorStyles.Left
+        };
+        _evernotePollFrequencyLabel = pollFrequencyLabel;
+        var pollIntervalNumeric = new NumericUpDown
+        {
+            Width = 120,
+            Minimum = 1,
+            Maximum = 1440,
+            Value = Math.Clamp(_appState.EvernotePollingIntervalMinutes, 1, 1440),
+            Anchor = AnchorStyles.Left
+        };
+        pollIntervalNumeric.ValueChanged += (_, _) =>
+        {
+            var newValue = (int)pollIntervalNumeric.Value;
+            if (newValue == _appState.EvernotePollingIntervalMinutes)
+            {
+                return;
+            }
+
+            _appState.EvernotePollingIntervalMinutes = newValue;
+            ApplyEvernotePollingSettings();
+            SaveAppStateNow(queueGoogleDriveSync: false);
+            _ = SyncConfigToGoogleDriveAsync(showErrors: false);
+        };
+
+        var pausePollingCheckBox = new CheckBox
+        {
+            AutoSize = true,
+            Text = UiLanguageService.T("Evernote.PauseAutomaticPolling"),
+            Checked = _appState.EvernotePollingPaused,
+            Anchor = AnchorStyles.Left
+        };
+        pausePollingCheckBox.CheckedChanged += async (_, _) =>
+        {
+            if (_syncingEvernotePausePollingToggle)
+            {
+                return;
+            }
+
+            if (_evernotePausePollingRequestInProgress)
+            {
+                SyncEvernotePausePollingCheckboxFromState();
+                return;
+            }
+
+            var requestedPauseState = pausePollingCheckBox.Checked;
+            _evernotePausePollingRequestInProgress = true;
+            SyncEvernotePausePollingCheckboxFromState();
+            UpdateEvernotePollingUiState();
+            await HandlePausePollingToggleFromUiAsync(requestedPauseState);
+        };
+
+        var pollingLockOwnerLabel = new Label
+        {
+            AutoSize = true,
+            ForeColor = Color.DarkRed,
+            Text = UiLanguageService.T("Evernote.LockNone"),
+            Anchor = AnchorStyles.Left
+        };
+
+        var pollingForceLockButton = new Button
+        {
+            Width = 82,
+            Height = 28,
+            Text = UiLanguageService.T("Evernote.Force"),
+            Anchor = AnchorStyles.Left
+        };
+        pollingForceLockButton.Click += async (_, _) => await HandleForcePollingLockFromUiAsync();
+
+        var pollingPendingRequestLabel = new Label
+        {
+            AutoSize = true,
+            ForeColor = Color.DarkOrange,
+            Text = string.Empty,
+            Visible = false,
+            Anchor = AnchorStyles.Left
+        };
+
+        var pollingNextStatePollLabel = new Label
+        {
+            AutoSize = true,
+            ForeColor = Color.DimGray,
+            Text = UiLanguageService.T("Evernote.StatePollDefault"),
+            Anchor = AnchorStyles.Left
+        };
+
+        var maxMarkdownLabel = new Label
+        {
+            AutoSize = true,
+            Text = UiLanguageService.T("Evernote.KeepLastX"),
+            Anchor = AnchorStyles.Left
+        };
+        _evernoteMaxMarkdownLabel = maxMarkdownLabel;
+        var maxMarkdownFilesNumeric = new NumericUpDown
+        {
+            Width = 120,
+            Minimum = 1,
+            Maximum = 1000,
+            Value = Math.Clamp(_appState.MaxMarkdownFilesToKeep, 1, 1000),
+            Anchor = AnchorStyles.Left
+        };
+        maxMarkdownFilesNumeric.ValueChanged += (_, _) =>
+        {
+            var newValue = (int)maxMarkdownFilesNumeric.Value;
+            if (newValue == _appState.MaxMarkdownFilesToKeep)
+            {
+                return;
+            }
+
+            _appState.MaxMarkdownFilesToKeep = newValue;
+            SaveAppStateNow(queueGoogleDriveSync: false);
+            _ = SyncConfigToGoogleDriveAsync(showErrors: false);
+        };
+
+        var maxMarkdownHelpLabel = new Label
+        {
+            AutoSize = true,
+            Text = UiLanguageService.T("Evernote.KeepLastXHelp"),
+            Anchor = AnchorStyles.Left
+        };
+        _evernoteMaxMarkdownHelpLabel = maxMarkdownHelpLabel;
+
+        settingsLayout.Controls.Add(pausePollingCheckBox, 0, 0);
+        settingsLayout.SetColumnSpan(pausePollingCheckBox, 2);
+        settingsLayout.Controls.Add(pollFrequencyLabel, 2, 0);
+        settingsLayout.Controls.Add(pollIntervalNumeric, 3, 0);
+        settingsLayout.Controls.Add(pollingLockOwnerLabel, 2, 1);
+        settingsLayout.Controls.Add(pollingForceLockButton, 3, 1);
+        settingsLayout.Controls.Add(pollingPendingRequestLabel, 2, 2);
+        settingsLayout.SetColumnSpan(pollingPendingRequestLabel, 2);
+        settingsLayout.Controls.Add(pollingNextStatePollLabel, 0, 1);
+        settingsLayout.SetColumnSpan(pollingNextStatePollLabel, 2);
+        settingsLayout.Controls.Add(maxMarkdownLabel, 0, 4);
+        settingsLayout.SetColumnSpan(maxMarkdownLabel, 2);
+        settingsLayout.Controls.Add(maxMarkdownFilesNumeric, 1, 4);
+        settingsLayout.Controls.Add(maxMarkdownHelpLabel, 0, 5);
+        settingsLayout.SetColumnSpan(maxMarkdownHelpLabel, 5);
+
+        var topLayout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            ColumnCount = 2,
+            RowCount = 1,
+            AutoSize = true,
+            Margin = new Padding(0)
+        };
+        topLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 30));
+        topLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 70));
+
+        var leftTopLayout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 4,
+            AutoSize = true,
+            Margin = new Padding(0)
+        };
+        leftTopLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        leftTopLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        leftTopLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        leftTopLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        leftTopLayout.Controls.Add(titleLabel, 0, 0);
+        leftTopLayout.Controls.Add(subtitleLabel, 0, 1);
+        leftTopLayout.Controls.Add(rootPathLayout, 0, 2);
+        leftTopLayout.Controls.Add(actionsLayout, 0, 3);
+
+        topLayout.Controls.Add(leftTopLayout, 0, 0);
+        topLayout.Controls.Add(settingsLayout, 1, 0);
+
         var statusLabel = new Label
         {
             AutoSize = true,
-            Margin = new Padding(0, 8, 0, 0),
-            Text = "Aucun dossier Evernote selectionne."
+            Margin = new Padding(0, 0, 0, 0),
+            Text = UiLanguageService.T("Evernote.NoFolderSelected")
         };
+        var statusPanel = new Panel
+        {
+            Dock = DockStyle.Fill,
+            Height = 24,
+            AutoScroll = true,
+            Margin = new Padding(0, 8, 0, 0)
+        };
+        statusPanel.Controls.Add(statusLabel);
 
         var treeHeaderLayout = new TableLayoutPanel
         {
@@ -614,14 +880,32 @@ internal sealed class MainForm : Form
         var showIgnoredCheckBox = new CheckBox
         {
             AutoSize = true,
-            Text = "Afficher ignores",
+            Text = UiLanguageService.T("Evernote.ShowIgnored"),
             Checked = _appState.EvernoteShowIgnoredItems,
-            Anchor = AnchorStyles.Right
+            Anchor = AnchorStyles.Left
         };
         showIgnoredCheckBox.CheckedChanged += EvernoteShowIgnoredCheckBox_CheckedChanged;
 
-        treeHeaderLayout.Controls.Add(new Label { AutoSize = true, Text = string.Empty }, 0, 0);
-        treeHeaderLayout.Controls.Add(showIgnoredCheckBox, 1, 0);
+        var treeHeaderLeftLayout = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Dock = DockStyle.Fill,
+            Margin = new Padding(0)
+        };
+        treeHeaderLeftLayout.Controls.Add(showIgnoredCheckBox);
+        var treeHintLabel = new Label
+        {
+            AutoSize = true,
+            Margin = new Padding(8, 4, 0, 0),
+            Text = UiLanguageService.T("Evernote.RightClickHint")
+        };
+        _evernoteTreeHintLabel = treeHintLabel;
+        treeHeaderLeftLayout.Controls.Add(treeHintLabel);
+
+        treeHeaderLayout.Controls.Add(treeHeaderLeftLayout, 0, 0);
+        treeHeaderLayout.Controls.Add(new Label { AutoSize = true, Text = string.Empty }, 1, 0);
 
         var exportProgressBar = new ProgressBar
         {
@@ -643,20 +927,55 @@ internal sealed class MainForm : Form
         treeView.NodeMouseClick += EvernoteTreeView_NodeMouseClick;
         treeView.BeforeExpand += EvernoteTreeView_BeforeExpand;
 
-        layout.Controls.Add(titleLabel, 0, 0);
-        layout.Controls.Add(subtitleLabel, 0, 1);
-        layout.Controls.Add(rootPathLayout, 0, 2);
-        layout.Controls.Add(actionsLayout, 0, 3);
-        layout.Controls.Add(statusLabel, 0, 4);
-        layout.Controls.Add(treeHeaderLayout, 0, 5);
-        layout.Controls.Add(exportProgressBar, 0, 6);
-        layout.Controls.Add(treeView, 0, 7);
+        layout.Controls.Add(topLayout, 0, 0);
+        layout.Controls.Add(treeHeaderLayout, 0, 1);
+        layout.Controls.Add(exportProgressBar, 0, 2);
+        layout.Controls.Add(treeView, 0, 3);
+        layout.Controls.Add(statusPanel, 0, 4);
 
         container.Controls.Add(layout);
 
         var configuredRootPath = GetConfiguredEvernoteRootPath();
         rootPathTextBox.Text = configuredRootPath ?? string.Empty;
-        return (container, rootPathTextBox, treeView, statusLabel, showIgnoredCheckBox, exportProgressBar);
+        return (
+            container,
+            rootPathTextBox,
+            treeView,
+            statusLabel,
+            showIgnoredCheckBox,
+            exportProgressBar,
+            pollIntervalNumeric,
+            pausePollingCheckBox,
+            pollingLockOwnerLabel,
+            pollingForceLockButton,
+            pollingPendingRequestLabel,
+            pollingNextStatePollLabel,
+            maxMarkdownFilesNumeric);
+    }
+
+    private void ApplyLocalizedEvernoteExportText()
+    {
+        if (_evernoteTitleLabel is null)
+        {
+            return;
+        }
+
+        _evernoteTitleLabel.Text = UiLanguageService.T("Evernote.Title");
+        _evernoteSubtitleLabel.Text = UiLanguageService.T("Evernote.Subtitle");
+        _chooseEvernoteFolderButton.Text = UiLanguageService.T("Evernote.FolderButton");
+        _reloadEvernoteButton.Text = UiLanguageService.T("Evernote.Reload");
+        _exportEvernoteButton.Text = UiLanguageService.T("Evernote.Export");
+        _evernotePollFrequencyLabel.Text = UiLanguageService.T("Evernote.PollFrequencyMinutes");
+        _evernotePausePollingCheckBox.Text = UiLanguageService.T("Evernote.PauseAutomaticPolling");
+        _evernotePollingForceLockButton.Text = UiLanguageService.T("Evernote.Force");
+        _evernoteMaxMarkdownLabel.Text = UiLanguageService.T("Evernote.KeepLastX");
+        _evernoteMaxMarkdownHelpLabel.Text = UiLanguageService.T("Evernote.KeepLastXHelp");
+        _evernoteShowIgnoredCheckBox.Text = UiLanguageService.T("Evernote.ShowIgnored");
+        _evernoteTreeHintLabel.Text = UiLanguageService.T("Evernote.RightClickHint");
+        if (string.IsNullOrWhiteSpace(_evernoteStatusLabel.Text))
+        {
+            _evernoteStatusLabel.Text = UiLanguageService.T("Evernote.NoFolderSelected");
+        }
     }
 
     private void EvernoteShowIgnoredCheckBox_CheckedChanged(object? sender, EventArgs e)
@@ -673,7 +992,7 @@ internal sealed class MainForm : Form
         }
 
         _appState.EvernoteShowIgnoredItems = shouldShowIgnored;
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Evernote show ignored set: {shouldShowIgnored}");
+        AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Evernote show ignored set: {shouldShowIgnored}");
         QueueAppStateSave();
         LoadEvernoteTreeFromConfiguredRoot(showErrors: false, refreshTracking: false);
     }
@@ -683,7 +1002,7 @@ internal sealed class MainForm : Form
         var currentPath = GetConfiguredEvernoteRootPath();
         using var dialog = new FolderBrowserDialog
         {
-            Description = "Choisir le dossier racine de l'installation Evernote",
+            Description = UiLanguageService.T("Evernote.ChooseRootFolderDescription"),
             ShowNewFolderButton = false
         };
 
@@ -706,7 +1025,7 @@ internal sealed class MainForm : Form
         _appState.EvernoteLocalDbPath = selectedPath;
         _evernoteDbPathTextBox.Text = selectedPath;
         ResetEvernoteTrackingBaseline();
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Evernote root path set: {selectedPath}");
+        AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Evernote root path set: {selectedPath}");
         QueueAppStateSave();
 
         LoadEvernoteTreeFromConfiguredRoot(showErrors: true);
@@ -741,16 +1060,20 @@ internal sealed class MainForm : Form
         if (string.IsNullOrWhiteSpace(rootPath))
         {
             PopulateEvernoteTree([]);
-            SetEvernoteStatus("Aucun dossier Evernote selectionne.");
+            SetEvernoteStatus(UiLanguageService.T("Evernote.NoFolderSelected"));
             return;
         }
 
         try
         {
-            var stacks = EvernoteLocalDbService.GetStacksAndNotebooks(rootPath, out var dbPath);
+            var stacks = _evernoteLocalDbService.GetStacksAndNotebooks(rootPath, out var dbPath);
             PopulateEvernoteTree(stacks);
             SetEvernoteStatus(
-                $"DB detectee: {dbPath} | Stacks: {stacks.Count} | Notebooks: {stacks.Sum(stack => stack.Notebooks.Count)}");
+                UiLanguageService.Tf(
+                    "Evernote.DbDetected",
+                    dbPath,
+                    stacks.Count,
+                    stacks.Sum(stack => stack.Notebooks.Count)));
             if (refreshTracking)
             {
                 PollEvernoteTracking(allowAutoExport: false, showErrors: false, ignorePause: false);
@@ -759,13 +1082,13 @@ internal sealed class MainForm : Form
         catch (Exception exception)
         {
             PopulateEvernoteTree([]);
-            SetEvernoteStatus($"Erreur DB: {exception.Message}");
+            SetEvernoteStatus(UiLanguageService.Tf("Evernote.DbError", exception.Message));
             if (showErrors)
             {
                 MessageBox.Show(
                     this,
-                    $"Impossible de lire la base Evernote.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
-                    "Evernote Export",
+                    UiLanguageService.Tf("Evernote.UnableToReadDatabase", exception.Message),
+                    UiLanguageService.T("App.EvernoteExport"),
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
             }
@@ -775,7 +1098,7 @@ internal sealed class MainForm : Form
     private void SetEvernoteStatus(string message)
     {
         _evernoteStatusLabel.Text = message;
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Evernote status: {message}");
+        AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Evernote status: {message}");
     }
 
     private void SyncEvernoteShowIgnoredCheckboxFromState()
@@ -886,11 +1209,15 @@ internal sealed class MainForm : Form
         bool ignored,
         string? exportFileName)
     {
-        var suffix = ignored ? " [ignored]" : string.Empty;
+        var suffix = ignored ? UiLanguageService.T("Evernote.Node.IgnoredSuffix") : string.Empty;
         var dateText = FormatEvernoteTimestamp(latestChangeMs);
-        var dateSuffix = string.IsNullOrWhiteSpace(dateText) ? string.Empty : $" | maj: {dateText}";
-        var exportSuffix = string.IsNullOrWhiteSpace(exportFileName) ? string.Empty : $" | export: {exportFileName}.md";
-        return $"{stackName} ({notebookCount} notebooks){exportSuffix}{dateSuffix}{suffix}";
+        var dateSuffix = string.IsNullOrWhiteSpace(dateText)
+            ? string.Empty
+            : UiLanguageService.Tf("Evernote.Node.UpdatedSuffix", dateText);
+        var exportSuffix = string.IsNullOrWhiteSpace(exportFileName)
+            ? string.Empty
+            : UiLanguageService.Tf("Evernote.Node.ExportSuffix", exportFileName);
+        return UiLanguageService.Tf("Evernote.Node.Stack", stackName, notebookCount, exportSuffix, dateSuffix, suffix);
     }
 
     private static string FormatNotebookNodeText(
@@ -900,11 +1227,15 @@ internal sealed class MainForm : Form
         bool ignored,
         string? exportFileName)
     {
-        var suffix = ignored ? " [ignored]" : string.Empty;
+        var suffix = ignored ? UiLanguageService.T("Evernote.Node.IgnoredSuffix") : string.Empty;
         var dateText = FormatEvernoteTimestamp(latestChangeMs);
-        var dateSuffix = string.IsNullOrWhiteSpace(dateText) ? string.Empty : $" | maj: {dateText}";
-        var exportSuffix = string.IsNullOrWhiteSpace(exportFileName) ? string.Empty : $" | export: {exportFileName}.md";
-        return $"{notebookName} ({noteCount} notes){exportSuffix}{dateSuffix}{suffix}";
+        var dateSuffix = string.IsNullOrWhiteSpace(dateText)
+            ? string.Empty
+            : UiLanguageService.Tf("Evernote.Node.UpdatedSuffix", dateText);
+        var exportSuffix = string.IsNullOrWhiteSpace(exportFileName)
+            ? string.Empty
+            : UiLanguageService.Tf("Evernote.Node.ExportSuffix", exportFileName);
+        return UiLanguageService.Tf("Evernote.Node.Notebook", notebookName, noteCount, exportSuffix, dateSuffix, suffix);
     }
 
     private static string FormatEvernoteTimestamp(long? timestampMs)
@@ -978,9 +1309,10 @@ internal sealed class MainForm : Form
         if (node?.Tag is not EvernoteTreeNodeTag tag)
         {
             _toggleIgnoreEvernoteNodeMenuItem.Enabled = false;
-            _toggleIgnoreEvernoteNodeMenuItem.Text = "Ignore";
+            _toggleIgnoreEvernoteNodeMenuItem.Text = UiLanguageService.T("Main.EvernoteMenu.Ignore");
             _setExportFileNameEvernoteNodeMenuItem.Enabled = false;
             _clearExportFileNameEvernoteNodeMenuItem.Enabled = false;
+            _clearExportFileNameEvernoteNodeMenuItem.Text = UiLanguageService.T("Main.EvernoteMenu.ClearExportFileName");
             return;
         }
 
@@ -992,15 +1324,23 @@ internal sealed class MainForm : Form
             : _appState.GetEvernoteNotebookExportFileName(tag.Id);
 
         _toggleIgnoreEvernoteNodeMenuItem.Enabled = true;
+        var localizedKind = GetLocalizedEvernoteNodeKind(tag.Kind);
         _toggleIgnoreEvernoteNodeMenuItem.Text = ignored
-            ? $"Unignore {tag.Kind.ToString().ToLowerInvariant()}"
-            : $"Ignore {tag.Kind.ToString().ToLowerInvariant()}";
+            ? UiLanguageService.Tf("Main.EvernoteMenu.UnignoreKind", localizedKind)
+            : UiLanguageService.Tf("Main.EvernoteMenu.IgnoreKind", localizedKind);
         _setExportFileNameEvernoteNodeMenuItem.Enabled = true;
-        _setExportFileNameEvernoteNodeMenuItem.Text = $"Set export file for {tag.Kind.ToString().ToLowerInvariant()}...";
+        _setExportFileNameEvernoteNodeMenuItem.Text = UiLanguageService.Tf("Main.EvernoteMenu.SetExportFileForKind", localizedKind);
         _clearExportFileNameEvernoteNodeMenuItem.Enabled = !string.IsNullOrWhiteSpace(currentExportFileName);
         _clearExportFileNameEvernoteNodeMenuItem.Text = string.IsNullOrWhiteSpace(currentExportFileName)
-            ? "Clear export file name"
-            : $"Clear export file ({currentExportFileName})";
+            ? UiLanguageService.T("Main.EvernoteMenu.ClearExportFileName")
+            : UiLanguageService.Tf("Main.EvernoteMenu.ClearExportFileWithName", currentExportFileName ?? string.Empty);
+    }
+
+    private static string GetLocalizedEvernoteNodeKind(EvernoteTreeNodeKind kind)
+    {
+        return kind == EvernoteTreeNodeKind.Stack
+            ? UiLanguageService.T("Main.Evernote.Kind.Stack")
+            : UiLanguageService.T("Main.Evernote.Kind.Notebook");
     }
 
     private void ToggleIgnoreForContextNode()
@@ -1060,12 +1400,12 @@ internal sealed class MainForm : Form
         if (tag.Kind == EvernoteTreeNodeKind.Stack)
         {
             _appState.SetEvernoteStackExportFileName(tag.Id, proposedValue);
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Stack export file set: {tag.Name} ({tag.Id}) -> {proposedValue}");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Stack export file set: {tag.Name} ({tag.Id}) -> {proposedValue}");
         }
         else
         {
             _appState.SetEvernoteNotebookExportFileName(tag.Id, proposedValue);
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Notebook export file set: {tag.Name} ({tag.Id}) -> {proposedValue}");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Notebook export file set: {tag.Name} ({tag.Id}) -> {proposedValue}");
         }
 
         UpdateNodeTextFromTag(node);
@@ -1088,12 +1428,12 @@ internal sealed class MainForm : Form
         if (tag.Kind == EvernoteTreeNodeKind.Stack)
         {
             _appState.SetEvernoteStackExportFileName(tag.Id, null);
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Stack export file cleared: {tag.Name} ({tag.Id})");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Stack export file cleared: {tag.Name} ({tag.Id})");
         }
         else
         {
             _appState.SetEvernoteNotebookExportFileName(tag.Id, null);
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Notebook export file cleared: {tag.Name} ({tag.Id})");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Notebook export file cleared: {tag.Name} ({tag.Id})");
         }
 
         UpdateNodeTextFromTag(node);
@@ -1109,7 +1449,7 @@ internal sealed class MainForm : Form
     {
         using var dialog = new Form
         {
-            Text = "Export File Name",
+            Text = UiLanguageService.T("Evernote.ExportFileNameDialogTitle"),
             StartPosition = FormStartPosition.CenterParent,
             FormBorderStyle = FormBorderStyle.FixedDialog,
             MaximizeBox = false,
@@ -1124,7 +1464,7 @@ internal sealed class MainForm : Form
             Left = 12,
             Top = 12,
             Width = 480,
-            Text = $"Nom de fichier d'export pour {containerName} (sans .md):"
+            Text = UiLanguageService.Tf("Evernote.ExportFileNameDialogLabel", containerName)
         };
 
         var textBox = new TextBox
@@ -1140,12 +1480,12 @@ internal sealed class MainForm : Form
             Left = 12,
             Top = 66,
             Width = 480,
-            Text = "Le meme nom permet de grouper plusieurs stacks/notebooks."
+            Text = UiLanguageService.T("Evernote.ExportFileNameDialogHint")
         };
 
         var okButton = new Button
         {
-            Text = "Save",
+            Text = UiLanguageService.T("Common.Save"),
             Left = 326,
             Top = 98,
             Width = 80,
@@ -1154,7 +1494,7 @@ internal sealed class MainForm : Form
 
         var cancelButton = new Button
         {
-            Text = "Cancel",
+            Text = UiLanguageService.T("Common.Cancel"),
             Left = 412,
             Top = 98,
             Width = 80,
@@ -1179,8 +1519,8 @@ internal sealed class MainForm : Form
         {
             MessageBox.Show(
                 this,
-                "Nom invalide. Utilise au moins un caractere valide.",
-                "Evernote Export",
+                UiLanguageService.T("Evernote.InvalidExportFileName"),
+                UiLanguageService.T("App.EvernoteExport"),
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Warning);
             return null;
@@ -1265,7 +1605,7 @@ internal sealed class MainForm : Form
             }
             else
             {
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {message}");
+                AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] {message}");
             }
 
             return false;
@@ -1280,7 +1620,7 @@ internal sealed class MainForm : Form
                 {
                     MessageBox.Show(
                         this,
-                        "Choisis d'abord le dossier racine Evernote.",
+                        "Choose the Evernote root folder first.",
                         "Evernote Export",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Information);
@@ -1296,7 +1636,7 @@ internal sealed class MainForm : Form
                 {
                     MessageBox.Show(
                         this,
-                        "Aucun notebook selectionne. Coche au moins un notebook ou une stack.",
+                        "No notebook selected. Check at least one notebook or stack.",
                         "Evernote Export",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Information);
@@ -1333,7 +1673,7 @@ internal sealed class MainForm : Form
 
             if (groups.Count == 0)
             {
-                SetEvernoteStatus("Aucun groupe d'export cible.");
+                SetEvernoteStatus("No target export group.");
                 return false;
             }
 
@@ -1355,7 +1695,7 @@ internal sealed class MainForm : Form
             var exportTasks = groups
                 .Select(group => Task.Run(() =>
                 {
-                    var result = EvernoteLocalDbService.ExportNotebookGroupToMarkdown(
+                    var result = _evernoteLocalDbService.ExportNotebookGroupToMarkdown(
                         rootPath,
                         group.NotebookIds,
                         group.ExportFileBaseName,
@@ -1366,7 +1706,7 @@ internal sealed class MainForm : Form
                     var finished = Interlocked.Increment(ref completedSteps);
                     progress.Report(new EvernoteExportProgressState(
                         finished,
-                        $"Export termine ({finished}/{groups.Count}): {group.ExportFileBaseName}.md"));
+                        $"Export completed ({finished}/{groups.Count}): {group.ExportFileBaseName}.md"));
                     return result;
                 }))
                 .ToArray();
@@ -1375,11 +1715,11 @@ internal sealed class MainForm : Form
 
             if (groupResults.Count == 0)
             {
-                SetEvernoteStatus("Aucun export genere.");
+                SetEvernoteStatus("No export generated.");
                 return false;
             }
 
-            if (GoogleDriveConfigSyncService.IsConfigured(_appState))
+            if (_googleDriveSyncService.IsConfigured(_appState))
             {
                 var uploadItems = new List<EvernoteDriveFileUploadItem>();
                 foreach (var result in groupResults)
@@ -1400,19 +1740,19 @@ internal sealed class MainForm : Form
                 if (uploadItems.Count > 0)
                 {
                     SetEvernoteExportProgressIndeterminate("Sync Google Drive en cours...");
-                    var driveSyncResult = await GoogleDriveConfigSyncService.SyncEvernoteMarkdownFilesAsync(
+                    var driveSyncResult = await _googleDriveSyncService.SyncEvernoteMarkdownFilesAsync(
                         _appState,
                         uploadItems,
                         CancellationToken.None);
 
                     if (!driveSyncResult.IsSuccess)
                     {
-                        Console.WriteLine(
+                        AppLogger.Debug(
                             $"[{DateTime.Now:HH:mm:ss}] Google Drive markdown sync failed: {driveSyncResult.Error}");
                     }
                     else
                     {
-                        Console.WriteLine(
+                        AppLogger.Debug(
                             $"[{DateTime.Now:HH:mm:ss}] Google Drive markdown sync ok: {driveSyncResult.UploadedFiles} file(s), {driveSyncResult.ConvertedGoogleDocs} Google Doc(s).");
                     }
                 }
@@ -1423,10 +1763,10 @@ internal sealed class MainForm : Form
             var exportedFiles = string.Join(
                 ", ",
                 groupResults.Select(result => Path.GetFileName(result.OutputFilePath)));
-            var cleanupInfo = deletedBackups > 0 ? $" | backups supprimes: {deletedBackups}" : string.Empty;
-            var status = $"Export termine ({source}): {groupResults.Count} fichiers, {totalNotes} notes -> {exportedFiles}{cleanupInfo}";
+            var cleanupInfo = deletedBackups > 0 ? $" | backups deleted: {deletedBackups}" : string.Empty;
+            var status = $"Export completed ({source}): {groupResults.Count} files, {totalNotes} notes -> {exportedFiles}{cleanupInfo}";
             SetEvernoteStatus(status);
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {status}");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] {status}");
 
             if (showDialogs)
             {
@@ -1434,11 +1774,11 @@ internal sealed class MainForm : Form
                     Environment.NewLine,
                     groupResults.Select(result => $"- {Path.GetFileName(result.OutputFilePath)} ({result.ExportedNotes} notes)"));
                 var backupLine = deletedBackups > 0
-                    ? $"{Environment.NewLine}{Environment.NewLine}Backups supprimes: {deletedBackups}"
+                    ? $"{Environment.NewLine}{Environment.NewLine}Backups deleted: {deletedBackups}"
                     : string.Empty;
                 MessageBox.Show(
                     this,
-                    $"Export termine.{Environment.NewLine}{Environment.NewLine}Fichiers:{Environment.NewLine}{filesLine}{backupLine}",
+                    $"Export completed.{Environment.NewLine}{Environment.NewLine}Files:{Environment.NewLine}{filesLine}{backupLine}",
                     "Evernote Export",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Information);
@@ -1448,12 +1788,12 @@ internal sealed class MainForm : Form
         }
         catch (Exception exception)
         {
-            SetEvernoteStatus($"Export echoue: {exception.Message}");
+            SetEvernoteStatus($"Export failed: {exception.Message}");
             if (showDialogs)
             {
                 MessageBox.Show(
                     this,
-                    $"Export impossible.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
+                    $"Export failed.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
                     "Evernote Export",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
@@ -1664,54 +2004,13 @@ internal sealed class MainForm : Form
     private static void LogEvernoteSelection(string type, string name, string id, bool isSelected)
     {
         var action = isSelected ? "selected" : "deselected";
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {type} {name} ({id}) {action}.");
+        AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] {type} {name} ({id}) {action}.");
     }
 
     private static void LogEvernoteIgnoreChange(string type, string name, string id, bool ignored)
     {
         var action = ignored ? "ignored" : "unignored";
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {type} {name} ({id}) {action}.");
-    }
-
-    private void TrayIcon_MouseClick(object? sender, MouseEventArgs e)
-    {
-        if (e.Button != MouseButtons.Left)
-        {
-            return;
-        }
-
-        ToggleWindowVisibilityFromTray();
-    }
-
-    private void ToggleWindowVisibilityFromTray()
-    {
-        if (Visible && WindowState != FormWindowState.Minimized)
-        {
-            HideToTray();
-            return;
-        }
-
-        RestoreFromTray();
-    }
-
-    private void UpdateTrayMenuItems()
-    {
-        _switchAppMenuItem.DropDownItems.Clear();
-        foreach (var app in Enum.GetValues<WrappedApp>())
-        {
-            if (app == _currentApp)
-            {
-                continue;
-            }
-
-            var targetApp = app;
-            _switchAppMenuItem.DropDownItems.Add(
-                AppConfig.GetAppDisplayName(targetApp),
-                null,
-                (_, _) => SwitchApp(targetApp, restoreFromTray: true));
-        }
-
-        _switchAppMenuItem.Enabled = _switchAppMenuItem.DropDownItems.Count > 0;
+        AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] {type} {name} ({id}) {action}.");
     }
 
     private void AppSwitcher_SelectedIndexChanged(object? sender, EventArgs e)
@@ -1787,7 +2086,7 @@ internal sealed class MainForm : Form
     private async void PollingLockSyncTimer_Tick(object? sender, EventArgs e)
     {
         _nextPollingStateSyncAtUtc = DateTimeOffset.UtcNow.AddMilliseconds(_pollingLockSyncTimer.Interval);
-        UpdateSettingsLockStatus();
+        UpdateEvernotePollingUiState();
         LogPollingLock($"Timer tick: launching distributed sync (next in {_pollingLockSyncTimer.Interval / 1000}s).");
         await SyncDistributedPollingStateAsync(showErrors: false, processIncomingRequests: true);
     }
@@ -1795,8 +2094,19 @@ internal sealed class MainForm : Form
     private void ApplyEvernotePollingSettings()
     {
         var intervalMinutes = Math.Max(1, _appState.EvernotePollingIntervalMinutes);
+        if (_evernotePollingIntervalMinutesNumeric.Value != intervalMinutes)
+        {
+            _evernotePollingIntervalMinutesNumeric.Value = intervalMinutes;
+        }
+        var maxMarkdownFilesToKeep = Math.Max(1, _appState.MaxMarkdownFilesToKeep);
+        if (_evernoteMaxMarkdownFilesNumeric.Value != maxMarkdownFilesToKeep)
+        {
+            _evernoteMaxMarkdownFilesNumeric.Value = maxMarkdownFilesToKeep;
+        }
+        SyncEvernotePausePollingCheckboxFromState();
         _evernotePollingTimer.Interval = checked(intervalMinutes * 60 * 1000);
         RefreshTrayPollingIconState();
+        UpdateEvernotePollingUiState();
 
         if (_appState.EvernotePollingPaused)
         {
@@ -1815,16 +2125,16 @@ internal sealed class MainForm : Form
         if (_distributedPollingSyncInProgress)
         {
             LogPollingLock("Sync skipped: another sync is already in progress.");
-            UpdateSettingsLockStatus();
+            UpdateEvernotePollingUiState();
             return;
         }
 
-        if (!GoogleDriveConfigSyncService.IsConfigured(_appState))
+        if (!_googleDriveSyncService.IsConfigured(_appState))
         {
             _lockOwnerInstanceId = _localMachineInstanceId;
             _lockOwnerDisplayName = GetLocalDisplayName();
             LogPollingLock("Sync skipped: Google Drive sync not configured, local instance treated as lock owner.");
-            UpdateSettingsLockStatus();
+            UpdateEvernotePollingUiState();
             return;
         }
 
@@ -1832,7 +2142,7 @@ internal sealed class MainForm : Form
         try
         {
             LogPollingLock($"Sync start (processIncomingRequests={processIncomingRequests}, paused={_appState.EvernotePollingPaused}, pending={DescribePendingLocalRequest()}).");
-            var metaListResult = await GoogleDriveConfigSyncService.ListPollingStateMetasAsync(_appState, CancellationToken.None);
+            var metaListResult = await _googleDriveSyncService.ListPollingStateMetasAsync(_appState, CancellationToken.None);
             if (!metaListResult.IsSuccess)
             {
                 LogPollingLock($"State meta list #1 failed: {metaListResult.Error ?? "unknown error"}");
@@ -1840,7 +2150,7 @@ internal sealed class MainForm : Form
                 {
                     MessageBox.Show(
                         this,
-                        $"Impossible de lire les state files de synchronisation.{Environment.NewLine}{Environment.NewLine}{metaListResult.Error}",
+                        $"Unable to read synchronization state files.{Environment.NewLine}{Environment.NewLine}{metaListResult.Error}",
                         "Distributed Polling Lock",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Error);
@@ -1897,7 +2207,7 @@ internal sealed class MainForm : Form
             if (ShouldUpsertLocalPollingState(localDocument))
             {
                 LogPollingLock($"Upserting local state '{_localMachineStateFileName}' (fileId={_localMachineStateFileId ?? "new"}): paused={localDocument.PauseAutomaticPolling}, pending={DescribePending(localDocument.PendingTakeoverRequest)}.");
-                var upsertResult = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+                var upsertResult = await _googleDriveSyncService.UpsertPollingStateAsync(
                     _appState,
                     _localMachineStateFileName,
                     localDocument,
@@ -1911,7 +2221,7 @@ internal sealed class MainForm : Form
                     {
                         MessageBox.Show(
                             this,
-                            $"Impossible de mettre a jour le state local de synchronisation.{Environment.NewLine}{Environment.NewLine}{upsertResult.Error}",
+                            $"Unable to update local synchronization state.{Environment.NewLine}{Environment.NewLine}{upsertResult.Error}",
                             "Distributed Polling Lock",
                             MessageBoxButtons.OK,
                             MessageBoxIcon.Error);
@@ -1934,7 +2244,7 @@ internal sealed class MainForm : Form
                 LogPollingLock("Local state upsert skipped (no relevant change, heartbeat not due).");
             }
 
-            metaListResult = await GoogleDriveConfigSyncService.ListPollingStateMetasAsync(_appState, CancellationToken.None);
+            metaListResult = await _googleDriveSyncService.ListPollingStateMetasAsync(_appState, CancellationToken.None);
             if (!metaListResult.IsSuccess)
             {
                 LogPollingLock($"State meta list #2 failed: {metaListResult.Error ?? "unknown error"}");
@@ -1960,7 +2270,7 @@ internal sealed class MainForm : Form
                 ApplyEvernotePollingSettings();
                 SaveAppStateNow(queueGoogleDriveSync: false);
                 localDocument = BuildLocalPollingStateDocument();
-                var forcedPauseResult = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+                var forcedPauseResult = await _googleDriveSyncService.UpsertPollingStateAsync(
                     _appState,
                     _localMachineStateFileName,
                     localDocument,
@@ -1991,12 +2301,12 @@ internal sealed class MainForm : Form
         catch (Exception exception)
         {
             LogPollingLock($"Sync exception: {exception.Message}");
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Distributed polling lock sync failed: {exception.Message}");
+            AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Distributed polling lock sync failed: {exception.Message}");
             if (showErrors)
             {
                 MessageBox.Show(
                     this,
-                    $"Erreur pendant la synchronisation distribuee du verrou de polling.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
+                    $"Error during distributed polling lock synchronization.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
                     "Distributed Polling Lock",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
@@ -2005,7 +2315,7 @@ internal sealed class MainForm : Form
         finally
         {
             _distributedPollingSyncInProgress = false;
-            UpdateSettingsLockStatus();
+            UpdateEvernotePollingUiState();
         }
     }
 
@@ -2116,7 +2426,7 @@ internal sealed class MainForm : Form
                 .ToList();
         }
 
-        var fullListResult = await GoogleDriveConfigSyncService.ListPollingStatesAsync(_appState, CancellationToken.None);
+        var fullListResult = await _googleDriveSyncService.ListPollingStatesAsync(_appState, CancellationToken.None);
         if (!fullListResult.IsSuccess)
         {
             LogPollingLock($"State full list {reason} failed: {fullListResult.Error ?? "unknown error"}");
@@ -2278,7 +2588,7 @@ internal sealed class MainForm : Form
             updatedLocalDocument.PendingTakeoverRequest = null;
             updatedLocalDocument.PauseAutomaticPolling = true;
             updatedLocalDocument.UpdatedAtUtc = nowUtc;
-            var localUpsert = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+            var localUpsert = await _googleDriveSyncService.UpsertPollingStateAsync(
                 _appState,
                 _localMachineStateFileName,
                 updatedLocalDocument,
@@ -2311,7 +2621,7 @@ internal sealed class MainForm : Form
         var preferredFileId = requesterState.FileId;
         for (var attempt = 1; attempt <= 3; attempt++)
         {
-            var upsert = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+            var upsert = await _googleDriveSyncService.UpsertPollingStateAsync(
                 _appState,
                 requesterState.FileName,
                 updatedRequesterDocument,
@@ -2331,7 +2641,7 @@ internal sealed class MainForm : Form
                 continue;
             }
 
-            var verificationList = await GoogleDriveConfigSyncService.ListPollingStatesAsync(_appState, CancellationToken.None);
+            var verificationList = await _googleDriveSyncService.ListPollingStatesAsync(_appState, CancellationToken.None);
             if (!verificationList.IsSuccess)
             {
                 LogPollingLock($"Requester verify list failed on attempt {attempt}/3: {verificationList.Error ?? "unknown error"}.");
@@ -2494,27 +2804,57 @@ internal sealed class MainForm : Form
             : $"{_localMachineHostName}_{_localMachineInstanceSuffix}";
     }
 
-    private void UpdateSettingsLockStatus()
+    private void SyncEvernotePausePollingCheckboxFromState()
     {
-        if (_settingsFormOpenInstance is null || _settingsFormOpenInstance.IsDisposed)
+        if (_evernotePausePollingCheckBox.Checked == _appState.EvernotePollingPaused)
         {
-            _settingsFormOpenInstance = null;
             return;
         }
 
-        var owner = string.IsNullOrWhiteSpace(_lockOwnerDisplayName) ? "(none)" : _lockOwnerDisplayName;
-        var isLocalOwner = string.Equals(_lockOwnerInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase);
-        _settingsFormOpenInstance.UpdatePollingLockStatus(owner, isLocalOwner);
-        _settingsFormOpenInstance.UpdatePendingPollingRequest(_pendingTakeoverTargetDisplayName);
-        _settingsFormOpenInstance.ConfirmPausePollingState(_appState.EvernotePollingPaused);
-        _settingsFormOpenInstance.SetPausePollingBusy(_settingsPauseChangeInProgress || _distributedPollingSyncInProgress || _settingsForceLockInProgress);
-        _settingsFormOpenInstance.SetForceLockBusy(_settingsForceLockInProgress || _distributedPollingSyncInProgress);
-        var intervalSeconds = Math.Max(1, _pollingLockSyncTimer.Interval / 1000);
-        var secondsUntilNextPoll = (int)Math.Ceiling((_nextPollingStateSyncAtUtc - DateTimeOffset.UtcNow).TotalSeconds);
-        _settingsFormOpenInstance.UpdateNextStatePollInfo(intervalSeconds, secondsUntilNextPoll);
+        _syncingEvernotePausePollingToggle = true;
+        try
+        {
+            _evernotePausePollingCheckBox.Checked = _appState.EvernotePollingPaused;
+        }
+        finally
+        {
+            _syncingEvernotePausePollingToggle = false;
+        }
     }
 
-    private async Task HandlePausePollingToggleFromSettingsAsync(bool isPaused)
+    private void UpdateEvernotePollingUiState()
+    {
+        var owner = string.IsNullOrWhiteSpace(_lockOwnerDisplayName)
+            ? UiLanguageService.T("Evernote.None")
+            : _lockOwnerDisplayName;
+        var isLocalOwner = string.Equals(_lockOwnerInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase);
+        _evernotePollingLockOwnerLabel.Text = UiLanguageService.Tf("Evernote.LockOwner", owner);
+        _evernotePollingLockOwnerLabel.ForeColor = isLocalOwner ? Color.DarkGreen : Color.DarkRed;
+
+        var hasPending = !string.IsNullOrWhiteSpace(_pendingTakeoverTargetDisplayName);
+        _evernotePollingPendingRequestLabel.Visible = hasPending;
+        _evernotePollingPendingRequestLabel.Text = hasPending
+            ? UiLanguageService.Tf("Evernote.AwaitingConfirmationFrom", _pendingTakeoverTargetDisplayName ?? string.Empty)
+            : string.Empty;
+
+        var intervalSeconds = Math.Max(1, _pollingLockSyncTimer.Interval / 1000);
+        var secondsUntilNextPoll = (int)Math.Ceiling((_nextPollingStateSyncAtUtc - DateTimeOffset.UtcNow).TotalSeconds);
+        _evernotePollingNextStatePollLabel.Text = UiLanguageService.Tf(
+            "Evernote.StatePoll",
+            intervalSeconds,
+            Math.Max(0, secondsUntilNextPoll));
+
+        var pauseBusy = _settingsPauseChangeInProgress || _distributedPollingSyncInProgress || _settingsForceLockInProgress;
+        _evernotePausePollingCheckBox.Enabled = !pauseBusy && !_evernotePausePollingRequestInProgress && !hasPending;
+        _evernotePollingForceLockButton.Enabled = !(_settingsForceLockInProgress || _distributedPollingSyncInProgress);
+
+        if (_settingsFormOpenInstance is not null && _settingsFormOpenInstance.IsDisposed)
+        {
+            _settingsFormOpenInstance = null;
+        }
+    }
+
+    private async Task HandlePausePollingToggleFromUiAsync(bool isPaused)
     {
         if (_settingsPauseChangeInProgress)
         {
@@ -2523,14 +2863,14 @@ internal sealed class MainForm : Form
         }
 
         _settingsPauseChangeInProgress = true;
-        UpdateSettingsLockStatus();
+        UpdateEvernotePollingUiState();
         try
         {
             await SyncDistributedPollingStateAsync(showErrors: false, processIncomingRequests: false);
 
             if (isPaused)
             {
-                LogPollingLock("Settings toggle: user paused polling locally.");
+                LogPollingLock("UI toggle: user paused polling locally.");
                 _appState.EvernotePollingPaused = true;
                 _pendingTakeoverRequestId = null;
                 _pendingTakeoverTargetInstanceId = null;
@@ -2541,7 +2881,7 @@ internal sealed class MainForm : Form
             }
             else
             {
-                LogPollingLock("Settings toggle: user requested to resume polling.");
+                LogPollingLock("UI toggle: user requested to resume polling.");
                 var localOwnsLock = string.Equals(_lockOwnerInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase);
                 var noCurrentOwner = string.IsNullOrWhiteSpace(_lockOwnerInstanceId);
                 if (localOwnsLock || noCurrentOwner)
@@ -2577,11 +2917,13 @@ internal sealed class MainForm : Form
         finally
         {
             _settingsPauseChangeInProgress = false;
-            UpdateSettingsLockStatus();
+            _evernotePausePollingRequestInProgress = false;
+            SyncEvernotePausePollingCheckboxFromState();
+            UpdateEvernotePollingUiState();
         }
     }
 
-    private async Task HandleForcePollingLockFromSettingsAsync()
+    private async Task HandleForcePollingLockFromUiAsync()
     {
         if (_settingsForceLockInProgress)
         {
@@ -2590,7 +2932,7 @@ internal sealed class MainForm : Form
 
         if (MessageBox.Show(
                 this,
-                "Cette action supprime tous les fichiers state dans Drive puis force ce poste comme lock owner actif. Continuer ?",
+                "This action deletes all state files in Drive and forces this machine as active lock owner. Continue?",
                 "Force lock",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Warning) != DialogResult.Yes)
@@ -2599,10 +2941,10 @@ internal sealed class MainForm : Form
         }
 
         _settingsForceLockInProgress = true;
-        UpdateSettingsLockStatus();
+        UpdateEvernotePollingUiState();
         try
         {
-            if (!GoogleDriveConfigSyncService.IsConfigured(_appState))
+            if (!_googleDriveSyncService.IsConfigured(_appState))
             {
                 _pendingTakeoverRequestId = null;
                 _pendingTakeoverTargetInstanceId = null;
@@ -2618,13 +2960,13 @@ internal sealed class MainForm : Form
                 return;
             }
 
-            var deleteResult = await GoogleDriveConfigSyncService.DeleteAllPollingStatesAsync(_appState, CancellationToken.None);
+            var deleteResult = await _googleDriveSyncService.DeleteAllPollingStatesAsync(_appState, CancellationToken.None);
             LogPollingLock($"Force lock delete states: success={deleteResult.IsSuccess}, deleted={deleteResult.DeletedFiles}, error={deleteResult.Error ?? "none"}.");
             if (!deleteResult.IsSuccess)
             {
                 MessageBox.Show(
                     this,
-                    $"Impossible de forcer le lock (suppression Drive).{Environment.NewLine}{Environment.NewLine}{deleteResult.Error}",
+                    $"Unable to force lock (Drive deletion).{Environment.NewLine}{Environment.NewLine}{deleteResult.Error}",
                     "Force lock",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
@@ -2650,7 +2992,7 @@ internal sealed class MainForm : Form
             localDocument.PendingTakeoverRequest = null;
             localDocument.PauseAutomaticPolling = false;
             localDocument.UpdatedAtUtc = DateTimeOffset.UtcNow;
-            var upsert = await GoogleDriveConfigSyncService.UpsertPollingStateAsync(
+            var upsert = await _googleDriveSyncService.UpsertPollingStateAsync(
                 _appState,
                 _localMachineStateFileName,
                 localDocument,
@@ -2661,7 +3003,7 @@ internal sealed class MainForm : Form
             {
                 MessageBox.Show(
                     this,
-                    $"Impossible de finaliser le force lock.{Environment.NewLine}{Environment.NewLine}{upsert.Error}",
+                    $"Unable to complete force lock.{Environment.NewLine}{Environment.NewLine}{upsert.Error}",
                     "Force lock",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
@@ -2676,15 +3018,15 @@ internal sealed class MainForm : Form
         finally
         {
             _settingsForceLockInProgress = false;
-            UpdateSettingsLockStatus();
+            SyncEvernotePausePollingCheckboxFromState();
+            UpdateEvernotePollingUiState();
         }
     }
 
     private void LogPollingLock(string message)
     {
         var line = $"[PollingLock:{_localMachineInstanceId}] {message}";
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {line}");
-        AppLogger.Info(line);
+        AppLogger.Debug(line);
     }
 
     private string DescribePendingLocalRequest()
@@ -2744,7 +3086,7 @@ internal sealed class MainForm : Form
             string dbPath;
             try
             {
-                trackingSnapshot = EvernoteLocalDbService.GetTrackingSnapshot(rootPath, out dbPath);
+                trackingSnapshot = _evernoteLocalDbService.GetTrackingSnapshot(rootPath, out dbPath);
             }
             catch (Exception exception)
             {
@@ -2752,13 +3094,13 @@ internal sealed class MainForm : Form
                 {
                     MessageBox.Show(
                         this,
-                        $"Polling Evernote impossible.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
+                        $"Evernote polling failed.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
                         "Evernote Export",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Error);
                 }
 
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Evernote polling failed: {exception.Message}");
+                AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] Evernote polling failed: {exception.Message}");
                 return;
             }
 
@@ -2780,8 +3122,10 @@ internal sealed class MainForm : Form
                 .Select(notebook => notebook.NotebookId)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
-            var currentNotebookMap = BuildNotebookSnapshotMap(trackingSnapshot.NotebookSnapshots);
-            var changeSummary = AnalyzeChangedNotes(monitoredNotebookIds, previousNotebookMap, currentNotebookMap);
+            var changeSummary = _evernoteChangeDetectionService.AnalyzeChangedNotes(
+                monitoredNotebookIds,
+                previousNotebookMap,
+                trackingSnapshot.NotebookSnapshots);
             if (changeSummary.NoteChangeCount >= 1)
             {
                 var targetExportFileNames = monitoredNotebooks
@@ -2824,783 +3168,6 @@ internal sealed class MainForm : Form
         }
     }
 
-    private static Dictionary<string, Dictionary<string, EvernoteNoteSnapshotState>> BuildNotebookSnapshotMap(
-        IEnumerable<EvernoteContainerNoteSnapshotState> containers)
-    {
-        var map = new Dictionary<string, Dictionary<string, EvernoteNoteSnapshotState>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var container in containers)
-        {
-            var notebookId = container.ContainerId ?? string.Empty;
-            if (!map.TryGetValue(notebookId, out var noteMap))
-            {
-                noteMap = new Dictionary<string, EvernoteNoteSnapshotState>(StringComparer.OrdinalIgnoreCase);
-                map[notebookId] = noteMap;
-            }
-
-            foreach (var note in container.Notes ?? [])
-            {
-                if (string.IsNullOrWhiteSpace(note.NoteId))
-                {
-                    continue;
-                }
-
-                noteMap[note.NoteId] = note;
-            }
-        }
-
-        return map;
-    }
-
-    private static EvernoteChangeSummary AnalyzeChangedNotes(
-        IReadOnlyCollection<string> monitoredNotebookIds,
-        Dictionary<string, Dictionary<string, EvernoteNoteSnapshotState>> previousMap,
-        Dictionary<string, Dictionary<string, EvernoteNoteSnapshotState>> currentMap)
-    {
-        var changeCount = 0;
-        var changedNotebookIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var notebookId in monitoredNotebookIds.Distinct(StringComparer.OrdinalIgnoreCase))
-        {
-            previousMap.TryGetValue(notebookId, out var previousNotes);
-            currentMap.TryGetValue(notebookId, out var currentNotes);
-
-            previousNotes ??= new Dictionary<string, EvernoteNoteSnapshotState>(StringComparer.OrdinalIgnoreCase);
-            currentNotes ??= new Dictionary<string, EvernoteNoteSnapshotState>(StringComparer.OrdinalIgnoreCase);
-
-            var noteIds = new HashSet<string>(previousNotes.Keys, StringComparer.OrdinalIgnoreCase);
-            noteIds.UnionWith(currentNotes.Keys);
-
-            foreach (var noteId in noteIds)
-            {
-                var existedBefore = previousNotes.TryGetValue(noteId, out var oldNote);
-                var existsNow = currentNotes.TryGetValue(noteId, out var newNote);
-
-                if (!existedBefore || !existsNow)
-                {
-                    changeCount++;
-                    changedNotebookIds.Add(notebookId);
-                    continue;
-                }
-
-                if (oldNote?.CreatedMs != newNote?.CreatedMs || oldNote?.UpdatedMs != newNote?.UpdatedMs)
-                {
-                    changeCount++;
-                    changedNotebookIds.Add(notebookId);
-                }
-            }
-        }
-
-        return new EvernoteChangeSummary(changeCount, changedNotebookIds);
-    }
-
-    private void ShowActiveContent()
-    {
-        var showingEvernoteExport = _currentApp == WrappedApp.EvernoteExport;
-        _evernoteExportPanel.Visible = showingEvernoteExport;
-        if (showingEvernoteExport)
-        {
-            LoadEvernoteTreeFromConfiguredRoot(showErrors: false);
-            _evernoteExportPanel.BringToFront();
-        }
-
-        foreach (var entry in _webViews)
-        {
-            entry.Value.Visible = entry.Key == _currentApp;
-        }
-
-        var currentWebView = GetCurrentWebView();
-        currentWebView?.BringToFront();
-    }
-
-    private void UpdateAppChrome()
-    {
-        var appName = AppConfig.GetAppDisplayName(_currentApp);
-        Text = AppVersionProvider.FormatWindowTitle(appName);
-        _trayIcon.Text = appName;
-        UpdateTrayMenuItems();
-    }
-
-    private void RefreshTrayPollingIconState(bool? pausedOverride = null)
-    {
-        if (_trayIcon is null)
-        {
-            return;
-        }
-
-        var isPollingPaused = pausedOverride ?? _appState.EvernotePollingPaused;
-        if (_traySyncAnimationTimer is null)
-        {
-            _trayIcon.Icon = isPollingPaused
-                ? AppIconProvider.GetTrayIdleIcon()
-                : AppIconProvider.GetTrayActiveIcon();
-            return;
-        }
-
-        var isEvernoteWorkInProgress = !isPollingPaused && (_evernotePollingInProgress || _evernoteExportInProgress);
-        if (isEvernoteWorkInProgress)
-        {
-            if (!_traySyncAnimationTimer.Enabled)
-            {
-                _traySyncAnimationFrameIndex = 0;
-                _traySyncAnimationTimer.Start();
-            }
-
-            SetTraySyncAnimationFrame(_traySyncAnimationFrameIndex);
-            return;
-        }
-
-        _traySyncAnimationTimer.Stop();
-        _traySyncAnimationFrameIndex = 0;
-        _trayIcon.Icon = isPollingPaused
-            ? AppIconProvider.GetTrayIdleIcon()
-            : AppIconProvider.GetTrayActiveIcon();
-    }
-
-    private void TraySyncAnimationTimer_Tick(object? sender, EventArgs e)
-    {
-        if (_traySyncAnimationTimer is null)
-        {
-            return;
-        }
-
-        var isEvernoteWorkInProgress = !_appState.EvernotePollingPaused && (_evernotePollingInProgress || _evernoteExportInProgress);
-        if (!isEvernoteWorkInProgress)
-        {
-            RefreshTrayPollingIconState();
-            return;
-        }
-
-        _traySyncAnimationFrameIndex++;
-        SetTraySyncAnimationFrame(_traySyncAnimationFrameIndex);
-    }
-
-    private void SetTraySyncAnimationFrame(int frameIndex)
-    {
-        var frames = AppIconProvider.GetTraySpinIcons();
-        if (frames.Count == 0)
-        {
-            _trayIcon.Icon = AppIconProvider.GetTrayActiveIcon();
-            return;
-        }
-
-        var normalizedIndex = Math.Abs(frameIndex % frames.Count);
-        _trayIcon.Icon = frames[normalizedIndex];
-    }
-
-    private void MainForm_WindowPlacementChanged(object? sender, EventArgs e)
-    {
-        CaptureWindowPlacement();
-        QueueAppStateSave();
-    }
-
-    private void MainForm_Resize(object? sender, EventArgs e)
-    {
-        if (WindowState == FormWindowState.Minimized)
-        {
-            HideToTray();
-        }
-
-        CaptureWindowPlacement();
-        QueueAppStateSave();
-    }
-
-    private void CaptureWindowPlacement()
-    {
-        _appState.LastWindowState = WindowState switch
-        {
-            FormWindowState.Maximized => SavedWindowState.Maximized,
-            FormWindowState.Minimized => SavedWindowState.Minimized,
-            _ => SavedWindowState.Normal
-        };
-
-        var normalBounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
-        if (normalBounds.Width <= 0 || normalBounds.Height <= 0)
-        {
-            return;
-        }
-
-        _appState.SetWindowBounds(normalBounds);
-    }
-
-    private void ApplySavedWindowPlacement()
-    {
-        if (_appState.TryGetWindowBounds(out var savedBounds) && IsUsableBounds(savedBounds))
-        {
-            StartPosition = FormStartPosition.Manual;
-            Bounds = savedBounds;
-        }
-
-        WindowState = _appState.LastWindowState switch
-        {
-            SavedWindowState.Maximized => FormWindowState.Maximized,
-            SavedWindowState.Minimized => FormWindowState.Minimized,
-            _ => FormWindowState.Normal
-        };
-    }
-
-    private static bool IsUsableBounds(Rectangle bounds)
-    {
-        if (bounds.Width < 400 || bounds.Height < 300)
-        {
-            return false;
-        }
-
-        foreach (var screen in Screen.AllScreens)
-        {
-            if (screen.WorkingArea.IntersectsWith(bounds))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private void QueueAppStateSave()
-    {
-        _windowStateSaveTimer.Stop();
-        _windowStateSaveTimer.Start();
-    }
-
-    private void WindowStateSaveTimer_Tick(object? sender, EventArgs e)
-    {
-        _windowStateSaveTimer.Stop();
-        PersistAppStateLocally(queueGoogleDriveSync: true);
-    }
-
-    private void SaveAppStateNow(bool queueGoogleDriveSync = true)
-    {
-        _windowStateSaveTimer.Stop();
-        PersistAppStateLocally(queueGoogleDriveSync);
-    }
-
-    private void PersistAppStateLocally(bool queueGoogleDriveSync)
-    {
-        AppStateStore.Save(_appState);
-        if (queueGoogleDriveSync)
-        {
-            QueueGoogleDriveSync();
-        }
-    }
-
-    private void QueueGoogleDriveSync()
-    {
-        if (_suspendGoogleDriveSyncQueue || !GoogleDriveConfigSyncService.IsConfigured(_appState))
-        {
-            return;
-        }
-
-        _googleDriveSyncTimer.Stop();
-        _googleDriveSyncTimer.Start();
-    }
-
-    private async void GoogleDriveSyncTimer_Tick(object? sender, EventArgs e)
-    {
-        _googleDriveSyncTimer.Stop();
-        await SyncConfigToGoogleDriveAsync(showErrors: false);
-    }
-
-    private async Task SyncConfigToGoogleDriveAsync(bool showErrors)
-    {
-        if (_googleDriveSyncInProgress || !GoogleDriveConfigSyncService.IsConfigured(_appState))
-        {
-            return;
-        }
-
-        _googleDriveSyncInProgress = true;
-        try
-        {
-            var syncState = CreateSharedSyncState(_appState);
-            var json = AppStateStore.Serialize(syncState);
-            var uploadResult = await GoogleDriveConfigSyncService.UploadConfigAsync(
-                _appState,
-                json,
-                CancellationToken.None);
-
-            if (!uploadResult.IsSuccess)
-            {
-                var error = uploadResult.Error ?? "Unknown Google Drive sync error.";
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive config sync failed: {error}");
-                if (showErrors)
-                {
-                    MessageBox.Show(
-                        this,
-                        $"Impossible de sauvegarder la configuration sur Google Drive.{Environment.NewLine}{Environment.NewLine}{error}",
-                        "Google Drive Sync",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Error);
-                }
-
-                return;
-            }
-
-            var fileId = uploadResult.FileId;
-            if (!string.IsNullOrWhiteSpace(fileId) &&
-                !string.Equals(_appState.GoogleDriveConfigFileId, fileId, StringComparison.Ordinal))
-            {
-                _appState.GoogleDriveConfigFileId = fileId;
-                AppStateStore.Save(_appState);
-            }
-
-            var modifiedLabel = uploadResult.ModifiedTimeUtc?.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") ?? "n/a";
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Google Drive config synced (file: {fileId ?? "new"}, modified: {modifiedLabel}).");
-        }
-        finally
-        {
-            _googleDriveSyncInProgress = false;
-        }
-    }
-
-    private void TopBarVisibilityTimer_Tick(object? sender, EventArgs e)
-    {
-        UpdateTopBarVisibility();
-    }
-
-    private void UpdateTopBarVisibility()
-    {
-        if (!Visible || WindowState == FormWindowState.Minimized)
-        {
-            SetTopBarVisible(false);
-            return;
-        }
-
-        var cursorInClient = PointToClient(Cursor.Position);
-        var isInsideWindow = ClientRectangle.Contains(cursorInClient);
-        var nearTopEdge = isInsideWindow && cursorInClient.Y >= 0 && cursorInClient.Y <= TopRevealThresholdPixels;
-        var overTopBar = _topBar.Visible && _topBar.Bounds.Contains(cursorInClient);
-        var switcherDropdownOpen = _appSwitcher.ComboBox?.DroppedDown == true;
-
-        SetTopBarVisible(nearTopEdge || overTopBar || switcherDropdownOpen);
-    }
-
-    private void SetTopBarVisible(bool visible)
-    {
-        if (_topBar.Visible == visible)
-        {
-            return;
-        }
-
-        _topBar.Visible = visible;
-        if (visible)
-        {
-            _topBar.BringToFront();
-        }
-    }
-
-    private async void OpenSettings()
-    {
-        if (_settingsFormOpenInstance is not null && !_settingsFormOpenInstance.IsDisposed)
-        {
-            _settingsFormOpenInstance.Activate();
-            _settingsFormOpenInstance.BringToFront();
-            return;
-        }
-
-        using var settingsForm = new SettingsForm(
-            _appState.CloseButtonBehavior,
-            _appState.EvernotePollingIntervalMinutes,
-            _appState.EvernotePollingPaused,
-            _appState.MaxMarkdownFilesToKeep,
-            _appState.GoogleDriveSyncEnabled,
-            _appState.GoogleDriveAutoRestoreOnStartup,
-            _appState.GoogleDriveClientId,
-            _appState.GoogleDriveClientSecret,
-            _appState.GoogleDriveConfigFileId);
-        _settingsFormOpenInstance = settingsForm;
-        settingsForm.FormClosed += (_, _) =>
-        {
-            if (ReferenceEquals(_settingsFormOpenInstance, settingsForm))
-            {
-                _settingsFormOpenInstance = null;
-            }
-        };
-        UpdateSettingsLockStatus();
-        await SyncDistributedPollingStateAsync(showErrors: false, processIncomingRequests: false);
-        settingsForm.EvernotePollingPausedChanged += async isPaused => await HandlePausePollingToggleFromSettingsAsync(isPaused);
-        settingsForm.ForcePollingLockRequested += async () => await HandleForcePollingLockFromSettingsAsync();
-        settingsForm.ExportSettingsRequested += () => ExportSettingsWithDialog(settingsForm);
-        settingsForm.ImportSettingsRequested += () =>
-        {
-            if (!ImportSettingsWithDialog(settingsForm))
-            {
-                return;
-            }
-
-            settingsForm.DialogResult = DialogResult.Cancel;
-            settingsForm.Close();
-        };
-        if (settingsForm.ShowDialog(this) != DialogResult.OK)
-        {
-            _settingsFormOpenInstance = null;
-            return;
-        }
-
-        var stateChanged = false;
-
-        if (settingsForm.SelectedCloseButtonBehavior != _appState.CloseButtonBehavior)
-        {
-            _appState.CloseButtonBehavior = settingsForm.SelectedCloseButtonBehavior;
-            stateChanged = true;
-        }
-
-        if (settingsForm.SelectedEvernotePollingIntervalMinutes != _appState.EvernotePollingIntervalMinutes)
-        {
-            _appState.EvernotePollingIntervalMinutes = settingsForm.SelectedEvernotePollingIntervalMinutes;
-            stateChanged = true;
-        }
-
-        if (settingsForm.SelectedMaxMarkdownFilesToKeep != _appState.MaxMarkdownFilesToKeep)
-        {
-            _appState.MaxMarkdownFilesToKeep = settingsForm.SelectedMaxMarkdownFilesToKeep;
-            stateChanged = true;
-        }
-
-        if (settingsForm.IsGoogleDriveSyncEnabled != _appState.GoogleDriveSyncEnabled)
-        {
-            _appState.GoogleDriveSyncEnabled = settingsForm.IsGoogleDriveSyncEnabled;
-            stateChanged = true;
-        }
-
-        if (settingsForm.IsGoogleDriveAutoRestoreOnStartup != _appState.GoogleDriveAutoRestoreOnStartup)
-        {
-            _appState.GoogleDriveAutoRestoreOnStartup = settingsForm.IsGoogleDriveAutoRestoreOnStartup;
-            stateChanged = true;
-        }
-
-        if (!string.Equals(settingsForm.GoogleDriveClientId, _appState.GoogleDriveClientId, StringComparison.Ordinal))
-        {
-            _appState.GoogleDriveClientId = settingsForm.GoogleDriveClientId;
-            stateChanged = true;
-        }
-
-        if (!string.Equals(settingsForm.GoogleDriveClientSecret, _appState.GoogleDriveClientSecret, StringComparison.Ordinal))
-        {
-            _appState.GoogleDriveClientSecret = settingsForm.GoogleDriveClientSecret;
-            stateChanged = true;
-        }
-
-        if (!string.Equals(settingsForm.GoogleDriveConfigFileId, _appState.GoogleDriveConfigFileId, StringComparison.Ordinal))
-        {
-            _appState.GoogleDriveConfigFileId = settingsForm.GoogleDriveConfigFileId;
-            stateChanged = true;
-        }
-
-        if (!stateChanged)
-        {
-            RefreshTrayPollingIconState();
-            _settingsFormOpenInstance = null;
-            return;
-        }
-
-        ApplyEvernotePollingSettings();
-        SaveAppStateNow(queueGoogleDriveSync: false);
-        await SyncDistributedPollingStateAsync(showErrors: true, processIncomingRequests: false);
-        _ = SyncConfigToGoogleDriveAsync(showErrors: true);
-        _settingsFormOpenInstance = null;
-    }
-
-    private void ExportSettingsWithDialog(IWin32Window owner)
-    {
-        using var dialog = new SaveFileDialog
-        {
-            Title = "Export settings",
-            Filter = "JSON files (*.json)|*.json|All files (*.*)|*.*",
-            FileName = $"WinGemini-settings-{DateTime.Now:yyyyMMdd-HHmmss}.json",
-            AddExtension = true,
-            DefaultExt = "json",
-            OverwritePrompt = true
-        };
-
-        if (dialog.ShowDialog(owner) != DialogResult.OK || string.IsNullOrWhiteSpace(dialog.FileName))
-        {
-            return;
-        }
-
-        try
-        {
-            var json = AppStateStore.Serialize(_appState);
-            File.WriteAllText(dialog.FileName, json);
-            MessageBox.Show(
-                owner,
-                $"Settings exported to:{Environment.NewLine}{dialog.FileName}",
-                "Settings export",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
-        }
-        catch (Exception exception)
-        {
-            MessageBox.Show(
-                owner,
-                $"Unable to export settings.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
-                "Settings export",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
-        }
-    }
-
-    private bool ImportSettingsWithDialog(IWin32Window owner)
-    {
-        if (MessageBox.Show(
-                owner,
-                "Importing a settings file will replace your current local configuration. Continue?",
-                "Import settings",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Warning) != DialogResult.Yes)
-        {
-            return false;
-        }
-
-        using var dialog = new OpenFileDialog
-        {
-            Title = "Import settings",
-            Filter = "JSON files (*.json)|*.json|All files (*.*)|*.*",
-            CheckFileExists = true,
-            Multiselect = false
-        };
-
-        if (dialog.ShowDialog(owner) != DialogResult.OK || string.IsNullOrWhiteSpace(dialog.FileName))
-        {
-            return false;
-        }
-
-        string json;
-        try
-        {
-            json = File.ReadAllText(dialog.FileName);
-        }
-        catch (Exception exception)
-        {
-            MessageBox.Show(
-                owner,
-                $"Unable to read the selected file.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
-                "Import settings",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
-            return false;
-        }
-
-        if (!AppStateStore.TryDeserialize(json, out var importedState))
-        {
-            MessageBox.Show(
-                owner,
-                "The selected file does not contain valid settings JSON.",
-                "Import settings",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
-            return false;
-        }
-
-        ApplyMachineLocalEvernoteSettings(source: _appState, target: importedState);
-        _appState = importedState;
-        _appState.Normalize();
-
-        var selectedApp = Enum.IsDefined(typeof(WrappedApp), _appState.LastSelectedApp)
-            ? _appState.LastSelectedApp
-            : AppConfig.DefaultApp;
-        if (_appSwitcher.SelectedIndex != (int)selectedApp)
-        {
-            _appSwitcher.SelectedIndex = (int)selectedApp;
-        }
-
-        _evernoteDbPathTextBox.Text = GetConfiguredEvernoteRootPath() ?? string.Empty;
-        SyncEvernoteShowIgnoredCheckboxFromState();
-        ApplyEvernotePollingSettings();
-        UpdateAppChrome();
-        LoadEvernoteTreeFromConfiguredRoot(showErrors: false, refreshTracking: false);
-        SaveAppStateNow(queueGoogleDriveSync: false);
-        _ = SyncConfigToGoogleDriveAsync(showErrors: true);
-
-        MessageBox.Show(
-            owner,
-            $"Settings imported from:{Environment.NewLine}{dialog.FileName}",
-            "Import settings",
-            MessageBoxButtons.OK,
-            MessageBoxIcon.Information);
-        return true;
-    }
-
-    private static AppState CreateSharedSyncState(AppState source)
-    {
-        var cloned = AppStateStore.Deserialize(AppStateStore.Serialize(source));
-        cloned.EvernoteLocalDbPath = null;
-        cloned.EvernotePollingPaused = false;
-        cloned.EvernotePollingIntervalMinutes = AppState.DefaultEvernotePollingIntervalMinutes;
-        cloned.Normalize();
-        return cloned;
-    }
-
-    private static void ApplyMachineLocalEvernoteSettings(AppState source, AppState target)
-    {
-        target.EvernoteLocalDbPath = source.EvernoteLocalDbPath;
-        target.EvernotePollingPaused = source.EvernotePollingPaused;
-        target.EvernotePollingIntervalMinutes = source.EvernotePollingIntervalMinutes;
-    }
-
-    private async Task LogoutAsync()
-    {
-        if (_logoutInProgress)
-        {
-            return;
-        }
-
-        if (MessageBox.Show(
-                this,
-                "This will sign you out of Google in this wrapper and clear saved session data. Continue?",
-                "Log out",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Question) != DialogResult.Yes)
-        {
-            return;
-        }
-
-        _logoutInProgress = true;
-        UseWaitCursor = true;
-
-        try
-        {
-            await EnsureWebViewInitializedAsync(WrappedApp.Gemini);
-            await EnsureWebViewInitializedAsync(WrappedApp.NotebookLm);
-            await EnsureWebViewInitializedAsync(WrappedApp.GoogleDrive);
-
-            var webViews = _webViews.Values.ToArray();
-            foreach (var webView in webViews)
-            {
-                var core = webView.CoreWebView2;
-                if (core is null)
-                {
-                    continue;
-                }
-
-                core.CookieManager.DeleteAllCookies();
-                await core.Profile.ClearBrowsingDataAsync();
-            }
-
-            _appState.SetLastUrl(WrappedApp.Gemini, null);
-            _appState.SetLastUrl(WrappedApp.NotebookLm, null);
-            _appState.SetLastUrl(WrappedApp.GoogleDrive, null);
-            SaveAppStateNow();
-
-            foreach (var app in _webViews.Keys.ToArray())
-            {
-                var webView = _webViews[app];
-                webView.CoreWebView2?.Navigate(AppConfig.GetAppUrl(app));
-            }
-
-            SwitchApp(AppConfig.DefaultApp, restoreFromTray: false);
-        }
-        catch (Exception exception)
-        {
-            MessageBox.Show(
-                this,
-                $"Could not complete logout.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
-                "Log out failed",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
-        }
-        finally
-        {
-            UseWaitCursor = false;
-            _logoutInProgress = false;
-        }
-    }
-
-    private void MainForm_FormClosing(object? sender, FormClosingEventArgs e)
-    {
-        if (_exitRequested)
-        {
-            _trayIcon.Visible = false;
-            return;
-        }
-
-        if (e.CloseReason != CloseReason.UserClosing)
-        {
-            return;
-        }
-
-        if (_appState.CloseButtonBehavior == CloseButtonBehavior.CloseApp)
-        {
-            _exitRequested = true;
-            CaptureWindowPlacement();
-            SaveAppStateNow();
-            _trayIcon.Visible = false;
-            return;
-        }
-
-        e.Cancel = true;
-        HideToTray();
-    }
-
-    private void HideToTray()
-    {
-        Hide();
-
-        if (_balloonShown)
-        {
-            return;
-        }
-
-        _balloonShown = true;
-        var appName = AppConfig.GetAppDisplayName(_currentApp);
-        _trayIcon.ShowBalloonTip(
-            2000,
-            $"{appName} is still running",
-            "Use the tray icon to reopen or exit.",
-            ToolTipIcon.Info);
-    }
-
-    private void RestoreFromTray()
-    {
-        Show();
-        if (WindowState == FormWindowState.Minimized)
-        {
-            WindowState = FormWindowState.Normal;
-        }
-
-        Activate();
-        UpdateTopBarVisibility();
-    }
-
-    private void ExitApplication()
-    {
-        _exitRequested = true;
-        CaptureWindowPlacement();
-        SaveAppStateNow();
-        _trayIcon.Visible = false;
-        Close();
-    }
-
-    private sealed record SelectedEvernoteNotebookForExport(
-        string NotebookId,
-        string NotebookName,
-        string StackId,
-        string StackName,
-        string ExportFileBaseName);
-
-    private sealed record EvernoteExportGroupWorkItem(
-        string ExportFileBaseName,
-        IReadOnlyList<string> NotebookIds);
-
-    private sealed record EvernoteExportProgressState(
-        int CompletedSteps,
-        string Message);
-
-    private sealed record EvernoteChangeSummary(
-        int NoteChangeCount,
-        IReadOnlySet<string> ChangedNotebookIds);
-
-    private enum EvernoteTreeNodeKind
-    {
-        Stack,
-        Notebook
-    }
-
-    private sealed record EvernoteTreeNodeTag(
-        EvernoteTreeNodeKind Kind,
-        string Id,
-        string Name,
-        int ItemCount = 0,
-        long? LatestChangeMs = null);
-
     protected override void Dispose(bool disposing)
     {
         if (disposing)
@@ -3624,3 +3191,5 @@ internal sealed class MainForm : Form
         base.Dispose(disposing);
     }
 }
+
+

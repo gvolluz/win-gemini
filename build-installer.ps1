@@ -14,8 +14,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$projectFile = Join-Path $projectRoot "WinGeminiWrapper.csproj"
-$issFile = Join-Path $projectRoot "installer\WinGeminiWrapper.iss"
+$projectFile = Join-Path $projectRoot "WinGemini.csproj"
+$issFile = Join-Path $projectRoot "installer\WinGemini.iss"
 $fallbackInstallPs1 = Join-Path $projectRoot "installer\Install-WinGemini.ps1"
 $fallbackInstallCmd = Join-Path $projectRoot "installer\install.cmd"
 $publishDir = Join-Path $projectRoot "artifacts\publish\$Runtime"
@@ -61,7 +61,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "dotnet publish failed with exit code $LASTEXITCODE."
 }
 
-$appExe = Join-Path $publishDir "WinGeminiWrapper.exe"
+$appExe = Join-Path $publishDir "WinGemini.exe"
 if (-not (Test-Path $appExe)) {
     throw "Publish completed but app executable was not found: $appExe"
 }
@@ -103,12 +103,12 @@ if (-not $IsccPath -or -not (Test-Path $IsccPath)) {
     $payloadDir = Join-Path $installerDir "payload"
     New-Item -ItemType Directory -Force -Path $payloadDir | Out-Null
 
-    Copy-Item -Path $appExe -Destination (Join-Path $payloadDir "WinGeminiWrapper.exe") -Force
+    Copy-Item -Path $appExe -Destination (Join-Path $payloadDir "WinGemini.exe") -Force
     Copy-Item -Path $fallbackInstallPs1 -Destination (Join-Path $payloadDir "Install-WinGemini.ps1") -Force
     Copy-Item -Path $fallbackInstallCmd -Destination (Join-Path $payloadDir "install.cmd") -Force
 
     $setupExe = $installerOutputPath
-    $sedFile = Join-Path $installerDir "WinGeminiWrapper-iexpress.sed"
+    $sedFile = Join-Path $installerDir "WinGemini-iexpress.sed"
     $iExpressPath = Join-Path $env:WINDIR "System32\iexpress.exe"
 
     if (-not (Test-Path $iExpressPath)) {
@@ -145,7 +145,7 @@ SourceFiles0=$payloadDir\
 %FILE1%=
 %FILE2%=
 [Strings]
-FILE0="WinGeminiWrapper.exe"
+FILE0="WinGemini.exe"
 FILE1="Install-WinGemini.ps1"
 FILE2="install.cmd"
 "@

@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Text.Json;
 using Google;
 using Google.Apis.Auth.OAuth2;
@@ -7,7 +7,7 @@ using Google.Apis.Drive.v3;
 using Google.Apis.Services;
 using Google.Apis.Util.Store;
 
-namespace WinGeminiWrapper;
+namespace WinGemini;
 
 internal static partial class GoogleDriveConfigSyncService
 {
@@ -332,3 +332,4 @@ internal static partial class GoogleDriveConfigSyncService
         }
     }
 }
+

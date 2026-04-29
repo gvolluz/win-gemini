@@ -1,6 +1,6 @@
-using System.Reflection;
+﻿using System.Reflection;
 
-namespace WinGeminiWrapper;
+namespace WinGemini;
 
 internal static class AppVersionProvider
 {
@@ -41,3 +41,4 @@ internal static class AppVersionProvider
         return $"{version.Major}.{version.Minor}";
     }
 }
+

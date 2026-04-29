@@ -1,4 +1,4 @@
-namespace WinGeminiWrapper;
+﻿namespace WinGemini;
 
 internal sealed record GoogleDriveConfigDownloadResult(
     bool IsSuccess,
@@ -149,3 +149,4 @@ internal sealed class GoogleDrivePollingTakeoverRequest
     public DateTimeOffset RequestedAtUtc { get; set; } = DateTimeOffset.UtcNow;
     public bool IsActive { get; set; }
 }
+

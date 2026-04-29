@@ -1,4 +1,4 @@
-namespace WinGeminiWrapper;
+﻿namespace WinGemini;
 
 internal static class AppConfig
 {
@@ -6,7 +6,7 @@ internal static class AppConfig
 
     internal static readonly string AppDataRootFolder = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "WinGeminiWrapper");
+        "WinGemini");
 
     internal const string GeminiAppUrl = "https://gemini.google.com/app";
     internal const string NotebookLmAppUrl = "https://notebooklm.google.com/";
@@ -22,7 +22,7 @@ internal static class AppConfig
     internal const string GoogleDriveTokenScopeVersion = "drivefile+drivemetadatareadonly+driveappdata-v1";
     internal const string GoogleDriveVisibleRootFolderName = "Apps";
     internal const string GoogleDriveVisibleAppFolderName = "WinGemini";
-    internal const string GoogleDriveConfigFileName = "WinGeminiWrapper.config.json";
+    internal const string GoogleDriveConfigFileName = "WinGemini.config.json";
     internal const string GoogleDrivePollingStateFilePrefix = "state_";
     internal const string EvernoteExportRootFolderName = "ExportEvernote";
     internal const string EvernoteExportBackupsFolderName = "backups";
@@ -39,9 +39,10 @@ internal static class AppConfig
     internal static string GetAppDisplayName(WrappedApp app) =>
         app switch
         {
-            WrappedApp.NotebookLm => "NotebookLM",
-            WrappedApp.GoogleDrive => "Google Drive",
-            WrappedApp.EvernoteExport => "Evernote Export",
-            _ => "Gemini"
+            WrappedApp.NotebookLm => UiLanguageService.T("App.NotebookLm"),
+            WrappedApp.GoogleDrive => UiLanguageService.T("App.GoogleDrive"),
+            WrappedApp.EvernoteExport => UiLanguageService.T("App.EvernoteExport"),
+            _ => UiLanguageService.T("App.Gemini")
         };
 }
+

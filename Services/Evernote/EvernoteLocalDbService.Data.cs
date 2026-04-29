@@ -1,11 +1,11 @@
-using System.Net;
+﻿using System.Net;
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
 using Microsoft.Data.Sqlite;
 
-namespace WinGeminiWrapper;
+namespace WinGemini;
 
 internal static partial class EvernoteLocalDbService
 {
@@ -292,3 +292,4 @@ internal static partial class EvernoteLocalDbService
         return deletedCount;
     }
 }
+

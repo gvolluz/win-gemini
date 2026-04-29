@@ -1,7 +1,7 @@
-using Microsoft.Web.WebView2.Core;
+﻿using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
-namespace WinGeminiWrapper;
+namespace WinGemini;
 
 internal sealed class LoginForm : Form
 {
@@ -161,3 +161,4 @@ internal sealed class LoginForm : Form
         base.Dispose(disposing);
     }
 }
+

@@ -1,4 +1,4 @@
-namespace WinGeminiWrapper;
+﻿namespace WinGemini;
 
 internal enum SavedWindowState
 {
@@ -6,3 +6,4 @@ internal enum SavedWindowState
     Maximized = 1,
     Minimized = 2
 }
+
