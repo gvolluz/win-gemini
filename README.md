@@ -1,6 +1,8 @@
-# Win Gemini Wrapper (Windows 11 Native)
+# Win Gemini Wrapper
 
-A native Windows desktop app (`WinForms + WebView2`) that wraps multiple Google apps and includes an Evernote export workspace with optional Google Drive sync.
+Windows desktop app (`WinForms + WebView2`) to keep Gemini/NotebookLM/Drive in one native shell, plus a dedicated Evernote -> Markdown export workspace with optional Google Drive sync.
+
+Current app version in source: `2.1.4`.
 
 **DISCLAIMER**
 1) This is initially a pure personal app, just for my own use case, but feel free to use it at your own risk
@@ -8,87 +10,101 @@ A native Windows desktop app (`WinForms + WebView2`) that wraps multiple Google 
 3) Translations have been done by Codex 5.3 in April 2026, so quality is what it is (no, I do not natively speak Russian... or even 95% of the other languages supported :D)
 4) Feel free to pull request if you have improvements, especially in the translations (sub-disclaimer: if any translation is absolute BS or even worse, insulting: feel free to blame Codex :P)
 
-## Wrapped apps
+## What the app includes today
 
-The top switcher lets you move between:
+- Wrapped apps: `Gemini`, `NotebookLM`, `Google Drive`, `Evernote Export`.
+- One persistent `WebView2` per web app, so switching tabs does not recreate the browser each time.
+- Login gate at startup:
+  - If an existing Google session is already valid, login form auto-completes in background.
+  - Otherwise the sign-in window is shown.
+- Top bar auto-reveal on mouse hover near top edge.
+- Last URL persistence per wrapped app (with URL domain guard per app type).
+- Window size/position/state persistence.
+- Tray behavior: hide/restore on click, app switch, refresh, settings, logout, exit.
+- Logout action clears `WebView2` cookies and browsing data.
+- UI localization (`auto` + many language codes from `Core/UiLanguageCatalog.cs`).
+- Optional debug logs (`%LOCALAPPDATA%\WinGemini\logs`).
 
-- `Gemini`
-- `NotebookLM`
-- `Google Drive`
-- `Evernote Export` (local DB reading + markdown export + Drive sync options)
+## Evernote export workspace
 
-Each web app keeps its own live `WebView2` instance, so switching apps does not force a full reload every time.
+- Reads Evernote local DB from a selected root folder (`UDB-User*+RemoteGraph.sql` auto-detected under it).
+- Displays stacks and notebooks in a tree.
+- Lets you select notebooks, ignore nodes, and define custom output base filename per stack/notebook.
+- Exports selected notes to Markdown in `ExportEvernote\`.
+- Creates timestamped backups in `ExportEvernote\backups\`.
+- Prunes old backups based on configurable max backup count.
+- Polls Evernote changes and can auto-export changed notebooks.
 
-## Main features
+## Google Drive features
 
-- Native Windows app (`.NET`, no Electron).
-- Embedded Edge (`WebView2`) rendering for wrapped web apps.
-- Auto-hidden top bar (revealed when hovering the top edge).
-- Last URL persisted per wrapped app and restored on startup.
-- Window position/size/state persisted and restored.
-- Tray workflow: minimize-to-tray, quick app switch, refresh, settings, exit.
-- Logout action clears local `WebView2` session data.
-- Startup login gate:
-  - If an existing Google session exists, login form stays hidden.
-  - Otherwise a login window opens and follows standard Google sign-in.
-
-## Evernote Export workspace
-
-The `Evernote Export` app is a dedicated configuration/export UI:
-
-- Reads Evernote local DB (`UDB-User*+RemoteGraph.sql`) from a selected root folder.
-- Displays stacks/notebooks and lets you select what to export.
-- Exports selected notes to markdown files under `ExportEvernote\`.
-- Keeps timestamped backups and prunes old backups based on settings.
-- Supports automatic polling of note changes.
-- Supports automatic export when changes are detected.
-- Can automatically sync exported markdown files to Google Drive.
-- Can convert primary markdown exports to Google Docs.
-
-## Google Drive sync (config + exports)
-
-The app supports Google OAuth and Drive sync features:
-
-- OAuth connection from Settings.
-- Sync of local app config JSON to Drive.
+- OAuth connect flow from Settings.
+  - Today, the app expects a Google OAuth Desktop client JSON (`client_id` / `client_secret`), either auto-detected in local defaults or selected manually once.
+- Sync local shared config JSON to Google Drive.
 - Optional auto-restore of config from Drive at startup.
-- Sync of Evernote markdown exports to Drive folders.
-- In-place update of existing Google Docs (keeps the same `fileId` when possible).
+- Sync exported Markdown files to Drive (`Apps/WinGemini/ExportEvernote`).
+- Optional Markdown -> Google Docs conversion/update.
+- Distributed polling lock state in Drive to coordinate auto-polling between multiple machines/instances.
 
-## Settings available
+### Create the OAuth JSON (official Google flow)
 
-- Close button behavior: `Minimize to tray` or `Close app`.
-- Evernote polling frequency (minutes).
-- Pause/resume automatic polling.
-- Max markdown backup files to keep.
-- Google Drive sync enable/disable.
-- Google Drive auto-restore on startup.
-- OAuth client setup and connect flow.
-- Optional Drive config file ID override.
+If you want to use Drive sync/export features, create an OAuth client of type **Desktop app** and download its JSON.
 
-## Local storage
+Official docs:
+- Create OAuth credentials (includes the "Desktop app" steps): https://developers.google.com/workspace/guides/create-credentials
+- Configure OAuth consent screen and scopes: https://developers.google.com/workspace/guides/configure-oauth-consent
+- Manage OAuth clients in Google Auth Platform (console help): https://support.google.com/cloud/answer/6158849
 
-- WebView profile/session data:
+Quick steps:
+1. Open Google Cloud project and enable the needed APIs (Drive API at minimum).
+2. Configure OAuth consent screen.
+3. Create OAuth client with type **Desktop app**.
+4. Download the JSON credentials file.
+5. In WinGemini Settings, connect using that file (or place it in the default detected location).
+
+Note: the current approach requires this one-time setup. The long-term UX target is a direct in-app "just sign in with Google" flow.
+
+## Settings currently available
+
+- UI language.
+- Close button behavior (`Minimize to tray` or `Close app`).
+- Enable/disable debug logging.
+- Enable/disable Google Drive sync.
+- Enable/disable Google Drive auto-restore on startup.
+- Connect Google OAuth credentials.
+- Optional config file ID override for Drive.
+- Export settings JSON.
+- Import settings JSON.
+
+## Local data paths
+
+- WebView profile/session:
   - `%LOCALAPPDATA%\WinGemini\WebView2`
-- Local app config/state:
+- Main local config/state:
   - `%LOCALAPPDATA%\WinGemini\local-config.json`
-- Legacy state path still supported for migration:
+- Legacy state path still written/read for compatibility:
   - `%LOCALAPPDATA%\WinGemini\app-state.json`
+- OAuth client cache file (when imported from file dialog):
+  - `%LOCALAPPDATA%\WinGemini\google-oauth-client.json`
+- OAuth token store:
+  - `%LOCALAPPDATA%\WinGemini\GoogleDriveTokens`
+- Logs:
+  - `%LOCALAPPDATA%\WinGemini\logs`
 
-## Prerequisites
+## Requirements
 
-- Windows 11
-- .NET 8 SDK
-- WebView2 Runtime (usually already installed with Microsoft Edge)
+- Windows (project target: `net8.0-windows`).
+- .NET 8 SDK for development.
+- Microsoft Edge WebView2 Runtime.
+- For Drive features: Google OAuth desktop client credentials.
 
-## Build and run
+## Run from source
 
 ```powershell
 dotnet restore
 dotnet run
 ```
 
-## Build release EXE and installer
+## Build release executable and installer
 
 ```powershell
 .\build-installer.ps1
@@ -99,18 +115,28 @@ Outputs:
 - App EXE (single-file): `artifacts\publish\win-x64\WinGemini.exe`
 - Installer EXE: `artifacts\installer\WinGeminiSetup-<version>-win-x64.exe`
 
-The setup EXE stays small by not bundling runtimes.
-If missing, the installer offers to download/install:
+Notes:
 
-- .NET Windows Desktop Runtime 8.x
-- Microsoft Edge WebView2 Runtime
+- The app is published `self-contained false` (runtime not bundled).
+- Installer can prompt to download missing prerequisites:
+  - `.NET Windows Desktop Runtime 8.x`
+  - `Microsoft Edge WebView2 Runtime`
+- If Inno Setup (`ISCC.exe`) is not found, the build script falls back to an IExpress installer.
 
-## Source layout
+## Project layout
 
-- `Program.cs` - startup flow (login gate then main window)
-- `Core/` - shared app config/providers/navigation helpers
-- `Models/` - state models and enums
-- `Services/Evernote/` - Evernote local DB reading and markdown conversion
-- `Services/GoogleDrive/` - OAuth, config sync, and markdown/doc sync
-- `UI/Forms/` - `LoginForm`, `MainForm`, `SettingsForm`
+- `Program.cs`: startup and global exception logging.
+- `Core/`: app config, navigation, localization, versioning, logging.
+- `Models/`: app state and enums.
+- `Services/Evernote/`: Evernote DB reading + markdown conversion + change detection.
+- `Services/GoogleDrive/`: OAuth + config sync + markdown/docs sync + distributed polling state files.
+- `UI/Forms/`: `LoginForm`, `MainForm`, `SettingsForm`.
+- `installer/`: setup scripts and Inno Setup descriptor.
+
+## License
+
+This project is licensed under the MIT License.
+
+Reference: see [LICENSE](./LICENSE).  
+MIT keeps the project permissive (use, modify, fork, redistribute), with preservation of copyright and license notice.
 
