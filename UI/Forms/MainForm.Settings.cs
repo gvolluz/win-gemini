@@ -13,9 +13,6 @@ internal sealed partial class MainForm
 
         using var settingsForm = new SettingsForm(
             _appState.CloseButtonBehavior,
-            _appState.EvernotePollingIntervalMinutes,
-            _appState.EvernotePollingPaused,
-            _appState.MaxMarkdownFilesToKeep,
             _appState.EnableDebugLogs,
             _appState.GoogleDriveSyncEnabled,
             _appState.GoogleDriveAutoRestoreOnStartup,
@@ -31,10 +28,6 @@ internal sealed partial class MainForm
                 _settingsFormOpenInstance = null;
             }
         };
-        UpdateSettingsLockStatus();
-        await SyncDistributedPollingStateAsync(showErrors: false, processIncomingRequests: false);
-        settingsForm.EvernotePollingPausedChanged += async isPaused => await HandlePausePollingToggleFromSettingsAsync(isPaused);
-        settingsForm.ForcePollingLockRequested += async () => await HandleForcePollingLockFromSettingsAsync();
         settingsForm.ExportSettingsRequested += () => ExportSettingsWithDialog(settingsForm);
         settingsForm.ImportSettingsRequested += () =>
         {
@@ -57,18 +50,6 @@ internal sealed partial class MainForm
         if (settingsForm.SelectedCloseButtonBehavior != _appState.CloseButtonBehavior)
         {
             _appState.CloseButtonBehavior = settingsForm.SelectedCloseButtonBehavior;
-            stateChanged = true;
-        }
-
-        if (settingsForm.SelectedEvernotePollingIntervalMinutes != _appState.EvernotePollingIntervalMinutes)
-        {
-            _appState.EvernotePollingIntervalMinutes = settingsForm.SelectedEvernotePollingIntervalMinutes;
-            stateChanged = true;
-        }
-
-        if (settingsForm.SelectedMaxMarkdownFilesToKeep != _appState.MaxMarkdownFilesToKeep)
-        {
-            _appState.MaxMarkdownFilesToKeep = settingsForm.SelectedMaxMarkdownFilesToKeep;
             stateChanged = true;
         }
 
@@ -116,7 +97,6 @@ internal sealed partial class MainForm
             return;
         }
 
-        ApplyEvernotePollingSettings();
         SaveAppStateNow(queueGoogleDriveSync: false);
         await SyncDistributedPollingStateAsync(showErrors: true, processIncomingRequests: false);
         _ = SyncConfigToGoogleDriveAsync(showErrors: true);

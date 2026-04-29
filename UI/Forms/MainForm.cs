@@ -31,6 +31,13 @@ internal sealed partial class MainForm : Form
     private readonly Label _evernoteStatusLabel;
     private readonly CheckBox _evernoteShowIgnoredCheckBox;
     private readonly ProgressBar _evernoteExportProgressBar;
+    private readonly NumericUpDown _evernotePollingIntervalMinutesNumeric;
+    private readonly CheckBox _evernotePausePollingCheckBox;
+    private readonly Label _evernotePollingLockOwnerLabel;
+    private readonly Button _evernotePollingForceLockButton;
+    private readonly Label _evernotePollingPendingRequestLabel;
+    private readonly Label _evernotePollingNextStatePollLabel;
+    private readonly NumericUpDown _evernoteMaxMarkdownFilesNumeric;
     private readonly SemaphoreSlim _evernoteExportSemaphore = new(1, 1);
     private readonly Dictionary<WrappedApp, WebView2> _webViews = new();
     private readonly System.Windows.Forms.Timer _windowStateSaveTimer;
@@ -55,6 +62,8 @@ internal sealed partial class MainForm : Form
     private bool _googleDriveSyncInProgress;
     private bool _suspendGoogleDriveSyncQueue;
     private bool _syncingEvernoteShowIgnoredToggle;
+    private bool _syncingEvernotePausePollingToggle;
+    private bool _evernotePausePollingRequestInProgress;
     private bool _exitRequested;
     private bool _balloonShown;
     private bool _logoutInProgress;
@@ -128,7 +137,14 @@ internal sealed partial class MainForm : Form
             _evernoteTreeView,
             _evernoteStatusLabel,
             _evernoteShowIgnoredCheckBox,
-            _evernoteExportProgressBar) = BuildEvernoteExportPanel();
+            _evernoteExportProgressBar,
+            _evernotePollingIntervalMinutesNumeric,
+            _evernotePausePollingCheckBox,
+            _evernotePollingLockOwnerLabel,
+            _evernotePollingForceLockButton,
+            _evernotePollingPendingRequestLabel,
+            _evernotePollingNextStatePollLabel,
+            _evernoteMaxMarkdownFilesNumeric) = BuildEvernoteExportPanel();
         _webViewHost.Controls.Add(_evernoteExportPanel);
 
         Controls.Add(_webViewHost);
@@ -177,7 +193,7 @@ internal sealed partial class MainForm : Form
         {
             Interval = 1000
         };
-        _settingsUiRefreshTimer.Tick += (_, _) => UpdateSettingsLockStatus();
+        _settingsUiRefreshTimer.Tick += (_, _) => UpdateEvernotePollingUiState();
 
         _traySyncAnimationTimer = new System.Windows.Forms.Timer
         {
@@ -511,7 +527,14 @@ internal sealed partial class MainForm : Form
         TreeView TreeView,
         Label StatusLabel,
         CheckBox ShowIgnoredCheckBox,
-        ProgressBar ExportProgressBar) BuildEvernoteExportPanel()
+        ProgressBar ExportProgressBar,
+        NumericUpDown PollIntervalNumeric,
+        CheckBox PausePollingCheckBox,
+        Label PollingLockOwnerLabel,
+        Button PollingForceLockButton,
+        Label PollingPendingRequestLabel,
+        Label PollingNextStatePollLabel,
+        NumericUpDown MaxMarkdownFilesNumeric) BuildEvernoteExportPanel()
     {
         var container = new Panel
         {
@@ -523,17 +546,14 @@ internal sealed partial class MainForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 8,
+            RowCount = 5,
             Padding = new Padding(16)
         };
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         var titleLabel = new Label
         {
@@ -545,15 +565,16 @@ internal sealed partial class MainForm : Form
         var subtitleLabel = new Label
         {
             AutoSize = true,
-            Margin = new Padding(0, 8, 0, 12),
-            Text = "Selectionne le dossier racine Evernote, puis exporte les notebooks coches. Clic droit: ignorer ou definir le nom de fichier d'export."
+            Margin = new Padding(0, 8, 0, 8),
+            Text = "Select the Evernote root folder, then export the checked notebooks."
         };
 
         var rootPathLayout = new TableLayoutPanel
         {
             Dock = DockStyle.Top,
             ColumnCount = 2,
-            AutoSize = true
+            AutoSize = true,
+            MaximumSize = new Size(520, 0)
         };
         rootPathLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         rootPathLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -568,7 +589,7 @@ internal sealed partial class MainForm : Form
         {
             AutoSize = true,
             Margin = new Padding(8, 0, 0, 0),
-            Text = "Dossier Evernote..."
+            Text = "Evernote Folder..."
         };
         chooseRootFolderButton.Click += (_, _) => ChooseEvernoteRootPath();
 
@@ -580,19 +601,24 @@ internal sealed partial class MainForm : Form
             AutoSize = true,
             FlowDirection = FlowDirection.LeftToRight,
             WrapContents = false,
-            Margin = new Padding(0, 10, 0, 0)
+            Margin = new Padding(0, 8, 0, 0)
         };
 
         var reloadButton = new Button
         {
-            AutoSize = true,
-            Text = "Recharger"
+            AutoSize = false,
+            Width = 90,
+            Height = 30,
+            Margin = new Padding(0, 0, 0, 0),
+            Text = "Reload"
         };
         reloadButton.Click += (_, _) => LoadEvernoteTreeFromConfiguredRoot(showErrors: true);
 
         var exportButton = new Button
         {
-            AutoSize = true,
+            AutoSize = false,
+            Width = 90,
+            Height = 30,
             Margin = new Padding(8, 0, 0, 0),
             Text = "Export"
         };
@@ -604,12 +630,210 @@ internal sealed partial class MainForm : Form
         actionsLayout.Controls.Add(reloadButton);
         actionsLayout.Controls.Add(exportButton);
 
+        var settingsLayout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 5,
+            RowCount = 6,
+            AutoSize = true,
+            Margin = new Padding(0)
+        };
+        settingsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        settingsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        settingsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        settingsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        settingsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        settingsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        settingsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        settingsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        settingsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        settingsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        settingsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        var pollFrequencyLabel = new Label
+        {
+            AutoSize = true,
+            Text = "Evernote polling frequency (minutes):",
+            Anchor = AnchorStyles.Left
+        };
+        var pollIntervalNumeric = new NumericUpDown
+        {
+            Width = 120,
+            Minimum = 1,
+            Maximum = 1440,
+            Value = Math.Clamp(_appState.EvernotePollingIntervalMinutes, 1, 1440),
+            Anchor = AnchorStyles.Left
+        };
+        pollIntervalNumeric.ValueChanged += (_, _) =>
+        {
+            var newValue = (int)pollIntervalNumeric.Value;
+            if (newValue == _appState.EvernotePollingIntervalMinutes)
+            {
+                return;
+            }
+
+            _appState.EvernotePollingIntervalMinutes = newValue;
+            ApplyEvernotePollingSettings();
+            SaveAppStateNow(queueGoogleDriveSync: false);
+            _ = SyncConfigToGoogleDriveAsync(showErrors: false);
+        };
+
+        var pausePollingCheckBox = new CheckBox
+        {
+            AutoSize = true,
+            Text = "Pause automatic polling",
+            Checked = _appState.EvernotePollingPaused,
+            Anchor = AnchorStyles.Left
+        };
+        pausePollingCheckBox.CheckedChanged += async (_, _) =>
+        {
+            if (_syncingEvernotePausePollingToggle)
+            {
+                return;
+            }
+
+            if (_evernotePausePollingRequestInProgress)
+            {
+                SyncEvernotePausePollingCheckboxFromState();
+                return;
+            }
+
+            var requestedPauseState = pausePollingCheckBox.Checked;
+            _evernotePausePollingRequestInProgress = true;
+            SyncEvernotePausePollingCheckboxFromState();
+            UpdateEvernotePollingUiState();
+            await HandlePausePollingToggleFromUiAsync(requestedPauseState);
+        };
+
+        var pollingLockOwnerLabel = new Label
+        {
+            AutoSize = true,
+            ForeColor = Color.DarkRed,
+            Text = "Lock: (none)",
+            Anchor = AnchorStyles.Left
+        };
+
+        var pollingForceLockButton = new Button
+        {
+            Width = 82,
+            Height = 28,
+            Text = "Force",
+            Anchor = AnchorStyles.Left
+        };
+        pollingForceLockButton.Click += async (_, _) => await HandleForcePollingLockFromUiAsync();
+
+        var pollingPendingRequestLabel = new Label
+        {
+            AutoSize = true,
+            ForeColor = Color.DarkOrange,
+            Text = string.Empty,
+            Visible = false,
+            Anchor = AnchorStyles.Left
+        };
+
+        var pollingNextStatePollLabel = new Label
+        {
+            AutoSize = true,
+            ForeColor = Color.DimGray,
+            Text = "State poll: every 6s, next in --s",
+            Anchor = AnchorStyles.Left
+        };
+
+        var maxMarkdownLabel = new Label
+        {
+            AutoSize = true,
+            Text = "Keep last X markdown exports:",
+            Anchor = AnchorStyles.Left
+        };
+        var maxMarkdownFilesNumeric = new NumericUpDown
+        {
+            Width = 120,
+            Minimum = 1,
+            Maximum = 1000,
+            Value = Math.Clamp(_appState.MaxMarkdownFilesToKeep, 1, 1000),
+            Anchor = AnchorStyles.Left
+        };
+        maxMarkdownFilesNumeric.ValueChanged += (_, _) =>
+        {
+            var newValue = (int)maxMarkdownFilesNumeric.Value;
+            if (newValue == _appState.MaxMarkdownFilesToKeep)
+            {
+                return;
+            }
+
+            _appState.MaxMarkdownFilesToKeep = newValue;
+            SaveAppStateNow(queueGoogleDriveSync: false);
+            _ = SyncConfigToGoogleDriveAsync(showErrors: false);
+        };
+
+        var maxMarkdownHelpLabel = new Label
+        {
+            AutoSize = true,
+            Text = "Older files in ./markdown will be deleted automatically after each export.",
+            Anchor = AnchorStyles.Left
+        };
+
+        settingsLayout.Controls.Add(pausePollingCheckBox, 0, 0);
+        settingsLayout.SetColumnSpan(pausePollingCheckBox, 2);
+        settingsLayout.Controls.Add(pollFrequencyLabel, 2, 0);
+        settingsLayout.Controls.Add(pollIntervalNumeric, 3, 0);
+        settingsLayout.Controls.Add(pollingLockOwnerLabel, 2, 1);
+        settingsLayout.Controls.Add(pollingForceLockButton, 3, 1);
+        settingsLayout.Controls.Add(pollingPendingRequestLabel, 2, 2);
+        settingsLayout.SetColumnSpan(pollingPendingRequestLabel, 2);
+        settingsLayout.Controls.Add(pollingNextStatePollLabel, 0, 1);
+        settingsLayout.SetColumnSpan(pollingNextStatePollLabel, 2);
+        settingsLayout.Controls.Add(maxMarkdownLabel, 0, 4);
+        settingsLayout.SetColumnSpan(maxMarkdownLabel, 2);
+        settingsLayout.Controls.Add(maxMarkdownFilesNumeric, 1, 4);
+        settingsLayout.Controls.Add(maxMarkdownHelpLabel, 0, 5);
+        settingsLayout.SetColumnSpan(maxMarkdownHelpLabel, 5);
+
+        var topLayout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            ColumnCount = 2,
+            RowCount = 1,
+            AutoSize = true,
+            Margin = new Padding(0)
+        };
+        topLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 30));
+        topLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 70));
+
+        var leftTopLayout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 4,
+            AutoSize = true,
+            Margin = new Padding(0)
+        };
+        leftTopLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        leftTopLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        leftTopLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        leftTopLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        leftTopLayout.Controls.Add(titleLabel, 0, 0);
+        leftTopLayout.Controls.Add(subtitleLabel, 0, 1);
+        leftTopLayout.Controls.Add(rootPathLayout, 0, 2);
+        leftTopLayout.Controls.Add(actionsLayout, 0, 3);
+
+        topLayout.Controls.Add(leftTopLayout, 0, 0);
+        topLayout.Controls.Add(settingsLayout, 1, 0);
+
         var statusLabel = new Label
         {
             AutoSize = true,
-            Margin = new Padding(0, 8, 0, 0),
-            Text = "Aucun dossier Evernote selectionne."
+            Margin = new Padding(0, 0, 0, 0),
+            Text = "No Evernote folder selected."
         };
+        var statusPanel = new Panel
+        {
+            Dock = DockStyle.Fill,
+            Height = 24,
+            AutoScroll = true,
+            Margin = new Padding(0, 8, 0, 0)
+        };
+        statusPanel.Controls.Add(statusLabel);
 
         var treeHeaderLayout = new TableLayoutPanel
         {
@@ -624,14 +848,30 @@ internal sealed partial class MainForm : Form
         var showIgnoredCheckBox = new CheckBox
         {
             AutoSize = true,
-            Text = "Afficher ignores",
+            Text = "Show ignored",
             Checked = _appState.EvernoteShowIgnoredItems,
-            Anchor = AnchorStyles.Right
+            Anchor = AnchorStyles.Left
         };
         showIgnoredCheckBox.CheckedChanged += EvernoteShowIgnoredCheckBox_CheckedChanged;
 
-        treeHeaderLayout.Controls.Add(new Label { AutoSize = true, Text = string.Empty }, 0, 0);
-        treeHeaderLayout.Controls.Add(showIgnoredCheckBox, 1, 0);
+        var treeHeaderLeftLayout = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Dock = DockStyle.Fill,
+            Margin = new Padding(0)
+        };
+        treeHeaderLeftLayout.Controls.Add(showIgnoredCheckBox);
+        treeHeaderLeftLayout.Controls.Add(new Label
+        {
+            AutoSize = true,
+            Margin = new Padding(8, 4, 0, 0),
+            Text = "Right-click: ignore or set export file name."
+        });
+
+        treeHeaderLayout.Controls.Add(treeHeaderLeftLayout, 0, 0);
+        treeHeaderLayout.Controls.Add(new Label { AutoSize = true, Text = string.Empty }, 1, 0);
 
         var exportProgressBar = new ProgressBar
         {
@@ -653,20 +893,30 @@ internal sealed partial class MainForm : Form
         treeView.NodeMouseClick += EvernoteTreeView_NodeMouseClick;
         treeView.BeforeExpand += EvernoteTreeView_BeforeExpand;
 
-        layout.Controls.Add(titleLabel, 0, 0);
-        layout.Controls.Add(subtitleLabel, 0, 1);
-        layout.Controls.Add(rootPathLayout, 0, 2);
-        layout.Controls.Add(actionsLayout, 0, 3);
-        layout.Controls.Add(statusLabel, 0, 4);
-        layout.Controls.Add(treeHeaderLayout, 0, 5);
-        layout.Controls.Add(exportProgressBar, 0, 6);
-        layout.Controls.Add(treeView, 0, 7);
+        layout.Controls.Add(topLayout, 0, 0);
+        layout.Controls.Add(treeHeaderLayout, 0, 1);
+        layout.Controls.Add(exportProgressBar, 0, 2);
+        layout.Controls.Add(treeView, 0, 3);
+        layout.Controls.Add(statusPanel, 0, 4);
 
         container.Controls.Add(layout);
 
         var configuredRootPath = GetConfiguredEvernoteRootPath();
         rootPathTextBox.Text = configuredRootPath ?? string.Empty;
-        return (container, rootPathTextBox, treeView, statusLabel, showIgnoredCheckBox, exportProgressBar);
+        return (
+            container,
+            rootPathTextBox,
+            treeView,
+            statusLabel,
+            showIgnoredCheckBox,
+            exportProgressBar,
+            pollIntervalNumeric,
+            pausePollingCheckBox,
+            pollingLockOwnerLabel,
+            pollingForceLockButton,
+            pollingPendingRequestLabel,
+            pollingNextStatePollLabel,
+            maxMarkdownFilesNumeric);
     }
 
     private void EvernoteShowIgnoredCheckBox_CheckedChanged(object? sender, EventArgs e)
@@ -693,7 +943,7 @@ internal sealed partial class MainForm : Form
         var currentPath = GetConfiguredEvernoteRootPath();
         using var dialog = new FolderBrowserDialog
         {
-            Description = "Choisir le dossier racine de l'installation Evernote",
+            Description = "Choose the root folder of the Evernote installation",
             ShowNewFolderButton = false
         };
 
@@ -751,7 +1001,7 @@ internal sealed partial class MainForm : Form
         if (string.IsNullOrWhiteSpace(rootPath))
         {
             PopulateEvernoteTree([]);
-            SetEvernoteStatus("Aucun dossier Evernote selectionne.");
+            SetEvernoteStatus("No Evernote folder selected.");
             return;
         }
 
@@ -760,7 +1010,7 @@ internal sealed partial class MainForm : Form
             var stacks = _evernoteLocalDbService.GetStacksAndNotebooks(rootPath, out var dbPath);
             PopulateEvernoteTree(stacks);
             SetEvernoteStatus(
-                $"DB detectee: {dbPath} | Stacks: {stacks.Count} | Notebooks: {stacks.Sum(stack => stack.Notebooks.Count)}");
+                $"DB detected: {dbPath} | Stacks: {stacks.Count} | Notebooks: {stacks.Sum(stack => stack.Notebooks.Count)}");
             if (refreshTracking)
             {
                 PollEvernoteTracking(allowAutoExport: false, showErrors: false, ignorePause: false);
@@ -769,12 +1019,12 @@ internal sealed partial class MainForm : Form
         catch (Exception exception)
         {
             PopulateEvernoteTree([]);
-            SetEvernoteStatus($"Erreur DB: {exception.Message}");
+            SetEvernoteStatus($"DB error: {exception.Message}");
             if (showErrors)
             {
                 MessageBox.Show(
                     this,
-                    $"Impossible de lire la base Evernote.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
+                    $"Unable to read Evernote database.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
                     "Evernote Export",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
@@ -1134,7 +1384,7 @@ internal sealed partial class MainForm : Form
             Left = 12,
             Top = 12,
             Width = 480,
-            Text = $"Nom de fichier d'export pour {containerName} (sans .md):"
+            Text = $"Export file name for {containerName} (without .md):"
         };
 
         var textBox = new TextBox
@@ -1290,7 +1540,7 @@ internal sealed partial class MainForm : Form
                 {
                     MessageBox.Show(
                         this,
-                        "Choisis d'abord le dossier racine Evernote.",
+                        "Choose the Evernote root folder first.",
                         "Evernote Export",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Information);
@@ -1306,7 +1556,7 @@ internal sealed partial class MainForm : Form
                 {
                     MessageBox.Show(
                         this,
-                        "Aucun notebook selectionne. Coche au moins un notebook ou une stack.",
+                        "No notebook selected. Check at least one notebook or stack.",
                         "Evernote Export",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Information);
@@ -1343,7 +1593,7 @@ internal sealed partial class MainForm : Form
 
             if (groups.Count == 0)
             {
-                SetEvernoteStatus("Aucun groupe d'export cible.");
+                SetEvernoteStatus("No target export group.");
                 return false;
             }
 
@@ -1376,7 +1626,7 @@ internal sealed partial class MainForm : Form
                     var finished = Interlocked.Increment(ref completedSteps);
                     progress.Report(new EvernoteExportProgressState(
                         finished,
-                        $"Export termine ({finished}/{groups.Count}): {group.ExportFileBaseName}.md"));
+                        $"Export completed ({finished}/{groups.Count}): {group.ExportFileBaseName}.md"));
                     return result;
                 }))
                 .ToArray();
@@ -1385,7 +1635,7 @@ internal sealed partial class MainForm : Form
 
             if (groupResults.Count == 0)
             {
-                SetEvernoteStatus("Aucun export genere.");
+                SetEvernoteStatus("No export generated.");
                 return false;
             }
 
@@ -1433,8 +1683,8 @@ internal sealed partial class MainForm : Form
             var exportedFiles = string.Join(
                 ", ",
                 groupResults.Select(result => Path.GetFileName(result.OutputFilePath)));
-            var cleanupInfo = deletedBackups > 0 ? $" | backups supprimes: {deletedBackups}" : string.Empty;
-            var status = $"Export termine ({source}): {groupResults.Count} fichiers, {totalNotes} notes -> {exportedFiles}{cleanupInfo}";
+            var cleanupInfo = deletedBackups > 0 ? $" | backups deleted: {deletedBackups}" : string.Empty;
+            var status = $"Export completed ({source}): {groupResults.Count} files, {totalNotes} notes -> {exportedFiles}{cleanupInfo}";
             SetEvernoteStatus(status);
             AppLogger.Debug($"[{DateTime.Now:HH:mm:ss}] {status}");
 
@@ -1444,11 +1694,11 @@ internal sealed partial class MainForm : Form
                     Environment.NewLine,
                     groupResults.Select(result => $"- {Path.GetFileName(result.OutputFilePath)} ({result.ExportedNotes} notes)"));
                 var backupLine = deletedBackups > 0
-                    ? $"{Environment.NewLine}{Environment.NewLine}Backups supprimes: {deletedBackups}"
+                    ? $"{Environment.NewLine}{Environment.NewLine}Backups deleted: {deletedBackups}"
                     : string.Empty;
                 MessageBox.Show(
                     this,
-                    $"Export termine.{Environment.NewLine}{Environment.NewLine}Fichiers:{Environment.NewLine}{filesLine}{backupLine}",
+                    $"Export completed.{Environment.NewLine}{Environment.NewLine}Files:{Environment.NewLine}{filesLine}{backupLine}",
                     "Evernote Export",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Information);
@@ -1458,12 +1708,12 @@ internal sealed partial class MainForm : Form
         }
         catch (Exception exception)
         {
-            SetEvernoteStatus($"Export echoue: {exception.Message}");
+            SetEvernoteStatus($"Export failed: {exception.Message}");
             if (showDialogs)
             {
                 MessageBox.Show(
                     this,
-                    $"Export impossible.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
+                    $"Export failed.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
                     "Evernote Export",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
@@ -1756,7 +2006,7 @@ internal sealed partial class MainForm : Form
     private async void PollingLockSyncTimer_Tick(object? sender, EventArgs e)
     {
         _nextPollingStateSyncAtUtc = DateTimeOffset.UtcNow.AddMilliseconds(_pollingLockSyncTimer.Interval);
-        UpdateSettingsLockStatus();
+        UpdateEvernotePollingUiState();
         LogPollingLock($"Timer tick: launching distributed sync (next in {_pollingLockSyncTimer.Interval / 1000}s).");
         await SyncDistributedPollingStateAsync(showErrors: false, processIncomingRequests: true);
     }
@@ -1764,8 +2014,19 @@ internal sealed partial class MainForm : Form
     private void ApplyEvernotePollingSettings()
     {
         var intervalMinutes = Math.Max(1, _appState.EvernotePollingIntervalMinutes);
+        if (_evernotePollingIntervalMinutesNumeric.Value != intervalMinutes)
+        {
+            _evernotePollingIntervalMinutesNumeric.Value = intervalMinutes;
+        }
+        var maxMarkdownFilesToKeep = Math.Max(1, _appState.MaxMarkdownFilesToKeep);
+        if (_evernoteMaxMarkdownFilesNumeric.Value != maxMarkdownFilesToKeep)
+        {
+            _evernoteMaxMarkdownFilesNumeric.Value = maxMarkdownFilesToKeep;
+        }
+        SyncEvernotePausePollingCheckboxFromState();
         _evernotePollingTimer.Interval = checked(intervalMinutes * 60 * 1000);
         RefreshTrayPollingIconState();
+        UpdateEvernotePollingUiState();
 
         if (_appState.EvernotePollingPaused)
         {
@@ -1784,7 +2045,7 @@ internal sealed partial class MainForm : Form
         if (_distributedPollingSyncInProgress)
         {
             LogPollingLock("Sync skipped: another sync is already in progress.");
-            UpdateSettingsLockStatus();
+            UpdateEvernotePollingUiState();
             return;
         }
 
@@ -1793,7 +2054,7 @@ internal sealed partial class MainForm : Form
             _lockOwnerInstanceId = _localMachineInstanceId;
             _lockOwnerDisplayName = GetLocalDisplayName();
             LogPollingLock("Sync skipped: Google Drive sync not configured, local instance treated as lock owner.");
-            UpdateSettingsLockStatus();
+            UpdateEvernotePollingUiState();
             return;
         }
 
@@ -1809,7 +2070,7 @@ internal sealed partial class MainForm : Form
                 {
                     MessageBox.Show(
                         this,
-                        $"Impossible de lire les state files de synchronisation.{Environment.NewLine}{Environment.NewLine}{metaListResult.Error}",
+                        $"Unable to read synchronization state files.{Environment.NewLine}{Environment.NewLine}{metaListResult.Error}",
                         "Distributed Polling Lock",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Error);
@@ -1880,7 +2141,7 @@ internal sealed partial class MainForm : Form
                     {
                         MessageBox.Show(
                             this,
-                            $"Impossible de mettre a jour le state local de synchronisation.{Environment.NewLine}{Environment.NewLine}{upsertResult.Error}",
+                            $"Unable to update local synchronization state.{Environment.NewLine}{Environment.NewLine}{upsertResult.Error}",
                             "Distributed Polling Lock",
                             MessageBoxButtons.OK,
                             MessageBoxIcon.Error);
@@ -1965,7 +2226,7 @@ internal sealed partial class MainForm : Form
             {
                 MessageBox.Show(
                     this,
-                    $"Erreur pendant la synchronisation distribuee du verrou de polling.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
+                    $"Error during distributed polling lock synchronization.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
                     "Distributed Polling Lock",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
@@ -1974,7 +2235,7 @@ internal sealed partial class MainForm : Form
         finally
         {
             _distributedPollingSyncInProgress = false;
-            UpdateSettingsLockStatus();
+            UpdateEvernotePollingUiState();
         }
     }
 
@@ -2463,27 +2724,52 @@ internal sealed partial class MainForm : Form
             : $"{_localMachineHostName}_{_localMachineInstanceSuffix}";
     }
 
-    private void UpdateSettingsLockStatus()
+    private void SyncEvernotePausePollingCheckboxFromState()
     {
-        if (_settingsFormOpenInstance is null || _settingsFormOpenInstance.IsDisposed)
+        if (_evernotePausePollingCheckBox.Checked == _appState.EvernotePollingPaused)
         {
-            _settingsFormOpenInstance = null;
             return;
         }
 
-        var owner = string.IsNullOrWhiteSpace(_lockOwnerDisplayName) ? "(none)" : _lockOwnerDisplayName;
-        var isLocalOwner = string.Equals(_lockOwnerInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase);
-        _settingsFormOpenInstance.UpdatePollingLockStatus(owner, isLocalOwner);
-        _settingsFormOpenInstance.UpdatePendingPollingRequest(_pendingTakeoverTargetDisplayName);
-        _settingsFormOpenInstance.ConfirmPausePollingState(_appState.EvernotePollingPaused);
-        _settingsFormOpenInstance.SetPausePollingBusy(_settingsPauseChangeInProgress || _distributedPollingSyncInProgress || _settingsForceLockInProgress);
-        _settingsFormOpenInstance.SetForceLockBusy(_settingsForceLockInProgress || _distributedPollingSyncInProgress);
-        var intervalSeconds = Math.Max(1, _pollingLockSyncTimer.Interval / 1000);
-        var secondsUntilNextPoll = (int)Math.Ceiling((_nextPollingStateSyncAtUtc - DateTimeOffset.UtcNow).TotalSeconds);
-        _settingsFormOpenInstance.UpdateNextStatePollInfo(intervalSeconds, secondsUntilNextPoll);
+        _syncingEvernotePausePollingToggle = true;
+        try
+        {
+            _evernotePausePollingCheckBox.Checked = _appState.EvernotePollingPaused;
+        }
+        finally
+        {
+            _syncingEvernotePausePollingToggle = false;
+        }
     }
 
-    private async Task HandlePausePollingToggleFromSettingsAsync(bool isPaused)
+    private void UpdateEvernotePollingUiState()
+    {
+        var owner = string.IsNullOrWhiteSpace(_lockOwnerDisplayName) ? "(none)" : _lockOwnerDisplayName;
+        var isLocalOwner = string.Equals(_lockOwnerInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase);
+        _evernotePollingLockOwnerLabel.Text = $"Lock: {owner}";
+        _evernotePollingLockOwnerLabel.ForeColor = isLocalOwner ? Color.DarkGreen : Color.DarkRed;
+
+        var hasPending = !string.IsNullOrWhiteSpace(_pendingTakeoverTargetDisplayName);
+        _evernotePollingPendingRequestLabel.Visible = hasPending;
+        _evernotePollingPendingRequestLabel.Text = hasPending
+            ? $"awaiting confirmation from {_pendingTakeoverTargetDisplayName}"
+            : string.Empty;
+
+        var intervalSeconds = Math.Max(1, _pollingLockSyncTimer.Interval / 1000);
+        var secondsUntilNextPoll = (int)Math.Ceiling((_nextPollingStateSyncAtUtc - DateTimeOffset.UtcNow).TotalSeconds);
+        _evernotePollingNextStatePollLabel.Text = $"State poll: every {intervalSeconds}s, next in {Math.Max(0, secondsUntilNextPoll)}s";
+
+        var pauseBusy = _settingsPauseChangeInProgress || _distributedPollingSyncInProgress || _settingsForceLockInProgress;
+        _evernotePausePollingCheckBox.Enabled = !pauseBusy && !_evernotePausePollingRequestInProgress && !hasPending;
+        _evernotePollingForceLockButton.Enabled = !(_settingsForceLockInProgress || _distributedPollingSyncInProgress);
+
+        if (_settingsFormOpenInstance is not null && _settingsFormOpenInstance.IsDisposed)
+        {
+            _settingsFormOpenInstance = null;
+        }
+    }
+
+    private async Task HandlePausePollingToggleFromUiAsync(bool isPaused)
     {
         if (_settingsPauseChangeInProgress)
         {
@@ -2492,14 +2778,14 @@ internal sealed partial class MainForm : Form
         }
 
         _settingsPauseChangeInProgress = true;
-        UpdateSettingsLockStatus();
+        UpdateEvernotePollingUiState();
         try
         {
             await SyncDistributedPollingStateAsync(showErrors: false, processIncomingRequests: false);
 
             if (isPaused)
             {
-                LogPollingLock("Settings toggle: user paused polling locally.");
+                LogPollingLock("UI toggle: user paused polling locally.");
                 _appState.EvernotePollingPaused = true;
                 _pendingTakeoverRequestId = null;
                 _pendingTakeoverTargetInstanceId = null;
@@ -2510,7 +2796,7 @@ internal sealed partial class MainForm : Form
             }
             else
             {
-                LogPollingLock("Settings toggle: user requested to resume polling.");
+                LogPollingLock("UI toggle: user requested to resume polling.");
                 var localOwnsLock = string.Equals(_lockOwnerInstanceId, _localMachineInstanceId, StringComparison.OrdinalIgnoreCase);
                 var noCurrentOwner = string.IsNullOrWhiteSpace(_lockOwnerInstanceId);
                 if (localOwnsLock || noCurrentOwner)
@@ -2546,11 +2832,13 @@ internal sealed partial class MainForm : Form
         finally
         {
             _settingsPauseChangeInProgress = false;
-            UpdateSettingsLockStatus();
+            _evernotePausePollingRequestInProgress = false;
+            SyncEvernotePausePollingCheckboxFromState();
+            UpdateEvernotePollingUiState();
         }
     }
 
-    private async Task HandleForcePollingLockFromSettingsAsync()
+    private async Task HandleForcePollingLockFromUiAsync()
     {
         if (_settingsForceLockInProgress)
         {
@@ -2559,7 +2847,7 @@ internal sealed partial class MainForm : Form
 
         if (MessageBox.Show(
                 this,
-                "Cette action supprime tous les fichiers state dans Drive puis force ce poste comme lock owner actif. Continuer ?",
+                "This action deletes all state files in Drive and forces this machine as active lock owner. Continue?",
                 "Force lock",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Warning) != DialogResult.Yes)
@@ -2568,7 +2856,7 @@ internal sealed partial class MainForm : Form
         }
 
         _settingsForceLockInProgress = true;
-        UpdateSettingsLockStatus();
+        UpdateEvernotePollingUiState();
         try
         {
             if (!_googleDriveSyncService.IsConfigured(_appState))
@@ -2593,7 +2881,7 @@ internal sealed partial class MainForm : Form
             {
                 MessageBox.Show(
                     this,
-                    $"Impossible de forcer le lock (suppression Drive).{Environment.NewLine}{Environment.NewLine}{deleteResult.Error}",
+                    $"Unable to force lock (Drive deletion).{Environment.NewLine}{Environment.NewLine}{deleteResult.Error}",
                     "Force lock",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
@@ -2630,7 +2918,7 @@ internal sealed partial class MainForm : Form
             {
                 MessageBox.Show(
                     this,
-                    $"Impossible de finaliser le force lock.{Environment.NewLine}{Environment.NewLine}{upsert.Error}",
+                    $"Unable to complete force lock.{Environment.NewLine}{Environment.NewLine}{upsert.Error}",
                     "Force lock",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
@@ -2645,7 +2933,8 @@ internal sealed partial class MainForm : Form
         finally
         {
             _settingsForceLockInProgress = false;
-            UpdateSettingsLockStatus();
+            SyncEvernotePausePollingCheckboxFromState();
+            UpdateEvernotePollingUiState();
         }
     }
 
@@ -2720,7 +3009,7 @@ internal sealed partial class MainForm : Form
                 {
                     MessageBox.Show(
                         this,
-                        $"Polling Evernote impossible.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
+                        $"Evernote polling failed.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
                         "Evernote Export",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Error);
